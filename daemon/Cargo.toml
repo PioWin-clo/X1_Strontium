@@ -1,0 +1,22 @@
+[package]
+name = "x1-strontium-daemon"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "x1-strontium"
+path = "src/main.rs"
+
+[dependencies]
+bs58             = "0.5"
+serde            = { version = "1", features = ["derive"] }
+serde_json       = "1"
+sha2             = "0.10"
+curve25519-dalek = { version = "4", default-features = false, features = ["digest"] }
+ed25519-dalek    = { version = "2", features = ["rand_core"] }
+ureq             = { version = "2", features = ["json"] }
+libc             = "0.2"
+wait-timeout     = "0.2"
+
+# Profile lives at the workspace root (avoids cargo's "profiles for non root
+# package will be ignored" warning).

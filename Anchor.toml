@@ -1,0 +1,19 @@
+[features]
+seeds = false
+skip-lint = false
+
+[programs.mainnet]
+x1_strontium = "2thzsm9z31MPEvDWHuuSGqAcjrr5ek4pS78EgPAT4Fch"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "https://rpc.mainnet.x1.xyz"
+wallet = "/Users/piowin/Desktop/X1/Sentinel/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+[workspace]
+members = ["programs/x1-strontium"]

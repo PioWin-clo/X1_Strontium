@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Match the v1.0 development toolchain baseline. The contract crate uses
+  # Anchor 0.30.1 + solana-program 1.18 which transitively pulls older
+  # crypto deps; newer nightly features aren't needed and pinning keeps
+  # `zeroize`/`curve25519-dalek` feature resolution deterministic.
+  RUST_VERSION: "1.94.1"
+
+jobs:
+  daemon:
+    name: daemon workspace (fmt + clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-daemon-${{ hashFiles('Cargo.toml', 'daemon/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-daemon-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        # --all runs every crate in the daemon workspace. Integration tests
+        # in programs/x1-strontium (live-mainnet, #[ignore]-gated) live in a
+        # separate workspace and are not touched here — they run only when
+        # explicitly unlocked with `cargo test -- --ignored`.
+        run: cargo test --all
+
+  contract:
+    name: contract crate (fmt + clippy + lib tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: programs/x1-strontium
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            programs/x1-strontium/target
+          key: ${{ runner.os }}-cargo-contract-${{ hashFiles('programs/x1-strontium/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-contract-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --lib
+        # `--lib` skips the tests/account_parse_integration.rs smoke test —
+        # that one hits live X1 mainnet and is #[ignore]-gated precisely so
+        # CI doesn't flake on it. Operators run it locally before deploy.
+        run: cargo test --lib

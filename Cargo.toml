@@ -1,0 +1,15 @@
+[workspace]
+members = ["daemon"]
+# `programs/x1-strontium` lives in its own Anchor workspace (see Anchor.toml).
+# Keeping it out of the root cargo workspace avoids a curve25519-dalek /
+# zeroize conflict between modern ed25519-dalek 2.x and Anchor's older
+# transitive solana-program 1.17.x dependencies.
+exclude = ["programs/x1-strontium"]
+resolver = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+overflow-checks = true

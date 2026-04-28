@@ -1,0 +1,43 @@
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Contract crate's Cargo.lock — Anchor lib crates don't commit lockfiles;
+# the daemon workspace's `./Cargo.lock` IS committed (binary crate).
+programs/x1-strontium/Cargo.lock
+
+# Defense-in-depth: any *-keypair.json (cargo build-sbf generates one
+# under target/, but if a stray copy lands elsewhere we still skip it).
+**/*-keypair.json
+
+# Anchor
+.anchor/
+dist/
+test-ledger/
+
+# Claude Code local cache (per-project state, not source)
+.claude/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (Anchor test scripts)
+node_modules/
+yarn-error.log
+npm-debug.log*
+
+# Local config / secrets
+*.local.toml
+.env
+.env.*
+!.env.example
+
+# Mission brief — local reference only, not part of product
+CLAUDE_CODE_PROMPT.md
