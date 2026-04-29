@@ -40,4 +40,4 @@ npm-debug.log*
 !.env.example
 
 # Mission brief — local reference only, not part of product
-CLAUDE_CODE_PROMPT.md
+CLAUDE_CODE_PROMPT*.md

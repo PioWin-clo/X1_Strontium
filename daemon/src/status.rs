@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SilentReason {
     InsufficientBalance,
+    InsufficientSelfStake,
     RegistrationExpired,
     NoHealthyRpc,
     TxRejected,
@@ -23,6 +24,7 @@ impl SilentReason {
     pub fn priority(self) -> u8 {
         match self {
             SilentReason::InsufficientBalance => 100,
+            SilentReason::InsufficientSelfStake => 95,
             SilentReason::RegistrationExpired => 90,
             SilentReason::NoHealthyRpc => 50,
             SilentReason::TxRejected => 50,
@@ -38,6 +40,7 @@ impl SilentReason {
     pub fn label(self) -> &'static str {
         match self {
             SilentReason::InsufficientBalance => "insufficient_balance",
+            SilentReason::InsufficientSelfStake => "insufficient_self_stake",
             SilentReason::RegistrationExpired => "registration_expired",
             SilentReason::NoHealthyRpc => "no_healthy_rpc",
             SilentReason::TxRejected => "tx_rejected",
