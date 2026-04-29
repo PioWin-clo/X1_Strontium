@@ -11,11 +11,14 @@ use crate::ntp_client::{discover_sources, get_system_clock_ms, to_source_status}
 use crate::rotation::{rotation_my_turn, window_has_submission, RotationState};
 use crate::status::{DaemonStatus, SilentReason};
 use crate::submitter::{
-    base64_encode, build_initialize_transaction, build_submit_transaction_signed,
-    derive_operator_pda, estimate_days_remaining, lamports_to_xnt, load_keypair, RpcClient,
-    SubmitParams, COST_PER_TX_XNT,
+    base64_encode, build_cleanup_inactive_transaction, build_initialize_transaction,
+    build_register_transaction, build_submit_transaction_signed, derive_registration_pda,
+    estimate_days_remaining, lamports_to_xnt, load_keypair, parse_vote_epoch_credits_len,
+    RegistrationEntry, RpcClient, SubmitParams, COST_PER_TX_XNT,
 };
+use ed25519_dalek::SigningKey;
 use std::env;
+use std::io::Read;
 use std::process;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,29 +31,30 @@ const READINESS_MAX_TRIES: u32 = 20;
 // Cadence for the two off-chain background tasks run inside the main cycle
 // loop (both gated by elapsed wall-clock time, reset after each run).
 const PEERS_REFETCH_SECS: i64 = 15 * 60;
-const SELF_STAKE_CHECK_SECS: i64 = 15 * 60;
+const SELF_STAKE_CHECK_SECS: i64 = 24 * 60 * 60; // 24 h, daemon-only
 
-// Slot-count threshold at which the daemon starts attaching stake accounts to
-// the submit TX so the contract's daily stake recheck can succeed. The
-// contract demands a recheck after 216_000 slots (~24 h); we pre-empt by ~1 h
-// at 200_000 slots so a TX failure doesn't strand the operator at the edge.
-const STAKE_CHECK_WARN_THRESHOLD_SLOTS: u64 = 200_000;
+/// Cleanup pre-flight throttle: if `OracleState.last_cleanup_slot` is more
+/// than this many slots behind the current slot, the daemon prepends a
+/// `cleanup_inactive` TX to its submission cycle. ~9000 slots ≈ 1 h at
+/// X1's 0.4 s slot time; "first daemon to notice the timeout fires it,
+/// rest see the updated last_cleanup_slot and skip" naturally distributes
+/// the cost across the fleet.
+const CLEANUP_STALE_SLOTS: u64 = 9_000;
 
-/// Bug #1 fix (v1.0): aligned with the on-chain contract's
-/// `MIN_SELF_STAKE_LAMPORTS = 128_000_000_000` (128 XNT). v0.5 had 100 XNT
-/// here and 128 XNT on chain, so operators never got an off-chain warning
-/// before the on-chain daily recheck started rejecting their TXs.
-///
-/// **MUST match `programs/x1-strontium/src/lib.rs` `MIN_SELF_STAKE_LAMPORTS`**.
-/// The `min_self_stake_matches_contract_value` unit test below is a tripwire
-/// that fails if this literal drifts from 128 XNT — if you intentionally
-/// change the contract's threshold, update both places and the test.
+/// Off-chain anti-farm gate (off-chain only — the contract holds no parser
+/// in v1.1). Operators with self-stake below this floor refuse to register
+/// and silence themselves at the 24 h recheck.
 const MIN_SELF_STAKE_LAMPORTS: u64 = 128_000_000_000;
+
+/// Off-chain anti-farm gate — minimum number of `epoch_credits` entries
+/// the validator's vote account must carry at register time (~64 epochs ≈
+/// 2 months of consistent voting on X1's epoch length).
+const MIN_EPOCH_HISTORY: u64 = 64;
 
 fn print_help() {
     println!(
         "\
-X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.0)
+X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.1)
 
 USAGE:
   x1-strontium <command> [options]
@@ -61,32 +65,32 @@ COMMANDS:
   stop                  Stop the running daemon and reap zombie processes
   status                Show daemon status, last TX, spread, confidence
   sources               Show NTP source table with RTT and offsets
-  balance               Show hot-signer keypair balance and runway
+  balance               Show oracle keypair balance and runway
   config show           Show current configuration
   config set <k> <v>    Set a config value
   read [--last N]       Decode Oracle PDA ring buffer (default: last 10)
   init [--authority <keypair>]
                         Initialize Oracle State PDA (one-time setup after deploy)
+  register              Register this validator as a Strontium operator
+                        (off-chain anti-farm gates: 64 epoch credits, 128 XNT
+                        qualifying self-stake; sends register_submitter TX)
   install               Install as systemd service (requires sudo)
   uninstall             Remove systemd service (requires sudo)
   update                Pull, rebuild, restart (git + cargo + systemctl)
 
-NOTE: operator on/off-boarding (initialize_operator, rotate_hot_signer,
-deactivate_operator, close_operator) is done via `solana` CLI + Ledger
-out-of-band — see docs/OPERATOR_ONBOARDING.md. The daemon only signs
-`submit_time` TXs.
-
 CONFIG KEYS:
-  hot_signer_keypair, vote_account, ledger_derivation_path, rpc, interval,
-  memo, dry_run, alert_webhook, alert_balance, tier_threshold,
-  rotation_peers, program_id, oracle_pda
+  oracle_keypair_path, vote_keypair_path, rpc, interval, memo, dry_run,
+  alert_webhook, alert_balance, tier_threshold, rotation_peers,
+  program_id, oracle_pda
 
-ORACLE PDA (v1.0):
-  EQ9CgHkx34AL7gaBHSX9nEWbwBtEfktbVGyQWEsTEtEy"
+ORACLE PDA (v1.1):
+  cfm1Tc7CNdTa8Hm8FGWAuHXaaozSjQHNmdBD5mEVN9P"
     );
 }
 
 fn main() {
+    install_panic_hook();
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         print_help();
@@ -124,6 +128,7 @@ fn main() {
         "update" => cmd_update(),
         "read" => cmd_read(&args[2..]),
         "init" => cmd_init(&args[2..]),
+        "register" => cmd_register(&args[2..]),
         "help" | "--help" | "-h" => print_help(),
         other => {
             eprintln!("unknown subcommand: {other}");
@@ -133,40 +138,52 @@ fn main() {
     }
 }
 
+/// Install a panic hook that captures the panic info, current UTC, and a
+/// backtrace into `~/.config/x1-strontium/last_crash.log`. Lets the
+/// operator inspect post-mortem after `systemctl restart` puts the daemon
+/// back online without needing `journalctl` access.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let log_path = format!(
+            "{}/.config/x1-strontium/last_crash.log",
+            env::var("HOME").unwrap_or_default()
+        );
+        if let Some(parent) = std::path::Path::new(&log_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let body = format!(
+            "X1 Strontium daemon crash\nunix_secs: {now_secs}\npanic: {info}\nbacktrace:\n{backtrace}\n"
+        );
+        let _ = std::fs::write(&log_path, body);
+        eprintln!("daemon panic logged to {log_path}");
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Daemon main loop
 // ---------------------------------------------------------------------------
 
 fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
-    // The daemon only ever holds the hot-signer keypair. Admin ops
-    // (initialize_operator, rotate_hot_signer, deactivate, close) are
-    // Ledger-signed out-of-band via `solana` CLI.
-    let hot_signer_path = config.hot_signer_keypair_path.as_ref().ok_or_else(|| {
-        "config.hot_signer_keypair_path is not set — run \
-             `x1-strontium config set hot_signer_keypair <path>`"
-            .to_string()
-    })?;
-    let vote_account_b58 = config.vote_account.as_ref().ok_or_else(|| {
-        "config.vote_account is not set — the vote account pubkey is required. Run: \
-             `x1-strontium config set vote_account <vote-account-pubkey>`"
+    // The daemon only ever holds the oracle.json keypair. Registration is
+    // a one-time `x1-strontium register` op that creates the on-chain
+    // ValidatorRegistration PDA; from then on the daemon signs
+    // `submit_time` every cycle and may fire `cleanup_inactive` when the
+    // on-chain `last_cleanup_slot` falls behind by more than ~1 h.
+    let oracle_path = config.oracle_keypair_path.as_ref().ok_or_else(|| {
+        "config.oracle_keypair_path is not set — run \
+             `x1-strontium config set oracle_keypair <path>` and \
+             `x1-strontium register` first"
             .to_string()
     })?;
 
-    let hot_signer_keypair = load_keypair(hot_signer_path)?;
-    let hot_signer_bytes: [u8; 32] = hot_signer_keypair.verifying_key().to_bytes();
-    let hot_signer_pubkey_b58 = bs58::encode(hot_signer_bytes).into_string();
-
-    let vote_account_raw = bs58::decode(vote_account_b58)
-        .into_vec()
-        .map_err(|e| format!("invalid vote_account: {e}"))?;
-    if vote_account_raw.len() != 32 {
-        return Err(format!(
-            "vote_account length {} != 32",
-            vote_account_raw.len()
-        ));
-    }
-    let mut vote_account: [u8; 32] = [0u8; 32];
-    vote_account.copy_from_slice(&vote_account_raw);
+    let oracle_keypair = load_keypair(oracle_path)?;
+    let oracle_bytes: [u8; 32] = oracle_keypair.verifying_key().to_bytes();
+    let oracle_pubkey_b58 = bs58::encode(oracle_bytes).into_string();
 
     let program_raw = bs58::decode(&config.program_id)
         .into_vec()
@@ -186,45 +203,60 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     let mut oracle_pda = [0u8; 32];
     oracle_pda.copy_from_slice(&oracle_pda_raw);
 
-    // operator_pda seeds are [b"operator", vote_account.as_ref()] — bound to
-    // the validator, not to any daemon-side keypair.
-    let operator_pda = derive_operator_pda(&vote_account, &program_id);
+    // ValidatorRegistration PDA — seeds [b"reg", oracle_keypair].
+    let registration_pda = derive_registration_pda(&oracle_bytes, &program_id);
+    let registration_pda_b58 = bs58::encode(registration_pda).into_string();
 
-    println!("X1 Strontium daemon starting (v1.0)");
-    println!("  hot_signer:      {hot_signer_pubkey_b58}");
-    println!("  vote_account:    {vote_account_b58}");
-    println!("  program id:      {}", config.program_id);
-    println!("  oracle pda:      {}", config.oracle_pda);
+    println!("X1 Strontium daemon starting (v1.1)");
+    println!("  oracle keypair:   {oracle_pubkey_b58}");
+    println!("  registration pda: {registration_pda_b58}");
+    println!("  program id:       {}", config.program_id);
+    println!("  oracle pda:       {}", config.oracle_pda);
     println!(
-        "  operator pda:    {}",
-        bs58::encode(operator_pda).into_string()
-    );
-    println!(
-        "  interval:        {}s  dry-run: {}",
+        "  interval:         {}s  dry-run: {}",
         config.interval_s, config.dry_run
     );
 
     readiness_check();
 
+    let mut rpc = RpcClient::new(config.rpc_urls.clone());
+
+    // Verify on-chain registration exists and is active before doing
+    // anything expensive. Skipping this would let the daemon happily run
+    // a full NTP cycle just to have the chain reject `submit_time` with
+    // RegistrationInactive (or AccountNotFound) — surface the problem at
+    // startup instead.
+    let own_registration = rpc.fetch_registration(&registration_pda).map_err(|e| {
+        format!(
+            "registration PDA {registration_pda_b58} not found on chain ({e})\n\
+             Run `x1-strontium register` first."
+        )
+    })?;
+    if !own_registration.is_active {
+        return Err(format!(
+            "registration {registration_pda_b58} is_active = false (cleaned up after \
+             missed turns). Re-run `x1-strontium register` to rejoin the operator set."
+        ));
+    }
+    let vote_account = own_registration.vote_account;
+    let vote_account_b58 = bs58::encode(vote_account).into_string();
+    println!("  vote account:     {vote_account_b58}  (from registration)");
+
     let mut status = DaemonStatus::load();
-    status.oracle_pubkey = hot_signer_pubkey_b58.clone();
+    status.oracle_pubkey = oracle_pubkey_b58.clone();
     status.interval_s = config.interval_s;
     status.dry_run = config.dry_run;
     status.pid = Some(process::id());
     status.running = true;
-    // `silent_cycles` and `silent_reason` are per-run counters. A previous
-    // session may have accumulated thousands of silent cycles — leaking that
-    // into a fresh start triggers phantom alerts on every cycle because
-    // `silent_cycles.is_multiple_of(10)` matches immediately. Reset so the
-    // new run starts from a clean slate.
+    // `silent_cycles` and `silent_reason` are per-run counters. Reset so a
+    // previous session's accumulated silence doesn't trigger phantom
+    // alerts on the first cycle of the new run.
     status.silent_cycles = 0;
     status.silent_reason = None;
     status.save();
 
-    let mut rpc = RpcClient::new(config.rpc_urls.clone());
-
     // Initial balance check.
-    match rpc.get_balance(&hot_signer_pubkey_b58) {
+    match rpc.get_balance(&oracle_pubkey_b58) {
         Ok(lamports) => {
             let bal = lamports_to_xnt(lamports);
             status.balance_xnt = bal;
@@ -247,7 +279,7 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     // Initial NTP discovery.
     let mut last_discovery = get_unix_secs();
     let mut sources = discover_sources(3);
-    println!("  initial sources: {} healthy", sources.len());
+    println!("  initial sources:  {} healthy", sources.len());
     for s in &sources {
         println!(
             "    {:<32} {:<10} rtt={:>4}ms offset={:>5}ms stratum={}",
@@ -259,46 +291,44 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
         );
     }
 
-    // Rotation tracks hot_signer pubkeys — that's the identity each daemon
-    // signs `submit_time` with, and the natural "which operator am I" key.
-    let mut rotation = RotationState::from_peers(&config.rotation_peers, &hot_signer_bytes);
-    let mut my_index = rotation.my_index(&hot_signer_bytes);
+    // Rotation tracks oracle keypair pubkeys — that's the identity each
+    // daemon signs `submit_time` with, and the natural "which operator am
+    // I" key.
+    let mut rotation = RotationState::from_peers(&config.rotation_peers, &oracle_bytes);
+    let mut my_index = rotation.my_index(&oracle_bytes);
     let mut n_oracles = rotation.n_oracles();
-    println!("  rotation:        index={my_index} of n={n_oracles}");
+    println!("  rotation:         index={my_index} of n={n_oracles}");
 
-    // Cache authorized_withdrawer on startup. The contract's init already
-    // enforces authorized_withdrawer == operator_pda.authority (Ledger) — so
-    // the daemon can filter stake accounts by this withdrawer to match what
-    // the daily recheck will count on chain. There is no local node identity
-    // key — hot_signer is unrelated to the validator's withdrawer.
-    let authorized_withdrawer_opt: Option<[u8; 32]> = match rpc.fetch_account_info(vote_account_b58)
-    {
-        Ok(data) if data.len() >= 68 => {
-            let mut w = [0u8; 32];
-            w.copy_from_slice(&data[36..68]);
-            println!(
-                "  authorized_withdrawer: {}  (must equal operator_pda.authority = Ledger)",
-                bs58::encode(w).into_string()
-            );
-            Some(w)
-        }
-        Ok(data) => {
-            eprintln!(
-                "[startup] vote account data too short ({} bytes) — did the validator ever vote?",
-                data.len()
-            );
-            None
-        }
-        Err(e) => {
-            eprintln!(
-                    "[startup] cannot fetch vote account — daily recheck will be skipped until next restart: {e}"
+    // Cache the vote account's authorized_withdrawer so the off-chain
+    // 24 h self-stake check can filter qualifying stakes by withdrawer.
+    let authorized_withdrawer_opt: Option<[u8; 32]> =
+        match rpc.fetch_account_info(&vote_account_b58) {
+            Ok(data) if data.len() >= 68 => {
+                let mut w = [0u8; 32];
+                w.copy_from_slice(&data[36..68]);
+                println!(
+                    "  authorized_withdrawer: {}  (filters qualifying self-stake)",
+                    bs58::encode(w).into_string()
                 );
-            None
-        }
-    };
+                Some(w)
+            }
+            Ok(data) => {
+                eprintln!(
+                    "[startup] vote account data too short ({} bytes) — self-stake \
+                 check disabled until next refresh",
+                    data.len()
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("[startup] cannot fetch vote account ({e}) — self-stake check disabled");
+                None
+            }
+        };
 
-    let mut last_peers_refetch: i64 = get_unix_secs();
-    let mut last_self_stake_check: i64 = get_unix_secs();
+    // Both 0 so the first cycle fires both refresh tasks immediately.
+    let mut last_peers_refetch: i64 = 0;
+    let mut last_self_stake_check: i64 = 0;
 
     // Align the first cycle to the next wall-clock window boundary (e.g. :00,
     // :05, :10 at the default 300 s interval) so memo timestamps are
@@ -311,7 +341,7 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
         status.last_attempt_ts = Some(cycle_started);
 
         // a. Balance check
-        match rpc.get_balance(&hot_signer_pubkey_b58) {
+        match rpc.get_balance(&oracle_pubkey_b58) {
             Ok(lamports) => {
                 let bal = lamports_to_xnt(lamports);
                 status.balance_xnt = bal;
@@ -339,12 +369,13 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         }
 
-        // b1. Auto-refetch active operator list from chain every 15 min.
+        // b1. Auto-refetch active registrations from chain every 15 min.
         //     Hot-reloads rotation state without restart.
         if cycle_started - last_peers_refetch >= PEERS_REFETCH_SECS {
-            match rpc.fetch_active_operators(&program_id) {
-                Ok(peers) => {
-                    let new_rotation = RotationState::from_peers_raw(&peers, &hot_signer_bytes);
+            match rpc.fetch_active_registrations(&program_id) {
+                Ok(regs) => {
+                    let peers: Vec<[u8; 32]> = regs.iter().map(|r| r.oracle_keypair).collect();
+                    let new_rotation = RotationState::from_peers_raw(&peers, &oracle_bytes);
                     let new_n = new_rotation.n_oracles();
                     if new_n != n_oracles {
                         println!(
@@ -353,7 +384,7 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
                         );
                     }
                     rotation = new_rotation;
-                    my_index = rotation.my_index(&hot_signer_bytes);
+                    my_index = rotation.my_index(&oracle_bytes);
                     n_oracles = rotation.n_oracles();
                     last_peers_refetch = cycle_started;
                 }
@@ -365,34 +396,58 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         }
 
-        // b2. Off-chain self-stake early warning every 15 min. If qualifying
-        //     self-stake drops below 128 XNT (Bug #1 fix — aligned with the
-        //     contract), the on-chain daily recheck WILL fail. Warn the
-        //     operator before they get silent.
+        // b2. Off-chain 24 h self-stake check. v1.1 contract holds no
+        //     parser; the daemon is the sole enforcer of the 128 XNT floor.
+        //     Below threshold → silence (don't submit) until stake recovers
+        //     or the contract's 10-missed-turns cleanup deregisters us.
         if cycle_started - last_self_stake_check >= SELF_STAKE_CHECK_SECS {
             if let Some(withdrawer) = authorized_withdrawer_opt {
                 match compute_self_stake_off_chain(&mut rpc, &vote_account, &withdrawer) {
                     Ok(stake) => {
                         if stake < MIN_SELF_STAKE_LAMPORTS {
                             eprintln!(
-                                "⚠️  self-stake {} XNT < 128 XNT — next daily recheck will FAIL",
+                                "⚠️  self-stake {} XNT < 128 XNT — daemon silenced; \
+                                 cleanup will deregister within 10 own turns",
                                 stake / 1_000_000_000
                             );
+                            status.set_silent_reason(SilentReason::InsufficientSelfStake);
+                            status.silent_cycles += 1;
+                            status.save();
                             if let Some(url) = &config.alert_webhook {
                                 send_alert_webhook(
                                     url,
                                     &format!(
-                                        "x1-strontium: self-stake dropped to {} XNT — will be deregistered at next daily recheck",
+                                        "x1-strontium: self-stake dropped to {} XNT — silenced; \
+                                         cleanup will deregister within 10 own turns",
                                         stake / 1_000_000_000
                                     ),
                                 );
                             }
+                            sleep(Duration::from_secs(config.interval_s));
+                            continue;
                         }
                     }
                     Err(e) => eprintln!("[self-stake check] {e}"),
                 }
             }
             last_self_stake_check = cycle_started;
+        }
+
+        // b3. Cleanup pre-flight. If the on-chain `last_cleanup_slot` is
+        //     stale by more than CLEANUP_STALE_SLOTS (~1 h), this daemon
+        //     pre-empts the cleanup work for the fleet. Whichever daemon
+        //     fires first stamps `last_cleanup_slot` and the rest skip.
+        if let Ok(header) = rpc.fetch_oracle_state_header(&oracle_pda) {
+            let current_slot = rpc.get_epoch_info().map(|e| e.absolute_slot).unwrap_or(0);
+            if current_slot > 0
+                && current_slot.saturating_sub(header.last_cleanup_slot) > CLEANUP_STALE_SLOTS
+            {
+                if let Err(e) =
+                    try_cleanup_inactive(&mut rpc, &oracle_keypair, &program_id, &oracle_pda)
+                {
+                    eprintln!("[cleanup] preflight skipped: {e}");
+                }
+            }
         }
 
         // c. Periodic NTP rediscovery.
@@ -418,13 +473,12 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             results.iter().map(|r| r.rtt_ms).min().unwrap_or(0)
         );
 
-        // f. Run consensus.
+        // f. Run consensus. Capture sys_at_consensus_ms right after so the
+        //    memo's `sys=` field reflects the daemon's clock at the
+        //    consensus moment (not after the chain RPC pipeline runs).
         let consensus = match run_consensus_cycle(&results, config.tier_consensus_threshold_ms) {
             Ok(c) => c,
             Err(reason) => {
-                // Print the exact rejection reason so the operator can tell
-                // "spread 170ms" (timestamps, wrong) from "spread 15ms"
-                // (offsets, below limit) at a glance.
                 eprintln!("[consensus] rejected: {}", reason.label());
                 let silent = match reason {
                     ConsensusRejection::InsufficientSources { .. }
@@ -441,6 +495,7 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
                 continue;
             }
         };
+        let sys_at_consensus_ms = get_system_clock_ms();
 
         // g. Print consensus.
         print_consensus(&consensus);
@@ -509,50 +564,6 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         };
 
-        // l'. Daily recheck gate — if we're within ~1 h of the 24 h stake
-        //     recheck deadline, fetch + filter stake accounts and attach them
-        //     as remaining_accounts so the contract's mandatory recheck
-        //     succeeds. Outside the window we pass an empty slice.
-        let stake_accounts_for_tx: Vec<[u8; 32]> = if let Some(withdrawer) =
-            authorized_withdrawer_opt
-        {
-            match rpc.fetch_operator(&operator_pda) {
-                Ok(reg) => {
-                    let current_slot = rpc
-                        .get_epoch_info()
-                        .map(|e| e.absolute_slot)
-                        .unwrap_or(reg.last_stake_check_slot);
-                    let slots_since = current_slot.saturating_sub(reg.last_stake_check_slot);
-                    if slots_since > STAKE_CHECK_WARN_THRESHOLD_SLOTS {
-                        match fetch_qualifying_stakes(&mut rpc, &vote_account, &withdrawer) {
-                            Ok(stakes) => {
-                                println!(
-                                    "[recheck] attaching {} stake accounts (slots_since={})",
-                                    stakes.len(),
-                                    slots_since
-                                );
-                                stakes
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                        "[recheck] cannot fetch stakes: {e} — submitting without; TX will fail if contract considers recheck due"
-                                    );
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        Vec::new()
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[recheck] cannot fetch registration: {e}");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
         // Measure elapsed since tsc_anchor. Anything over the contract's
         // MAX_SPREAD_MS budget triggers the safety fallback.
         let elapsed_ms = tsc_anchor.elapsed().as_millis() as i64;
@@ -563,23 +574,23 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             );
         }
 
-        // m. Build & sign.
+        // l. Build & sign. v1.1 submit_time touches only OracleState +
+        //    own registration — no vote_account, no remaining_accounts.
         let params = SubmitParams {
             consensus: &consensus,
             window_id,
             memo_enabled: config.memo_enabled,
             chain_time_ms,
             precise_time_ms,
+            sys_at_consensus_ms,
         };
         let tx = build_submit_transaction_signed(
-            &hot_signer_keypair,
+            &oracle_keypair,
             &program_id,
             &oracle_pda,
-            &operator_pda,
-            &vote_account,
+            &registration_pda,
             &blockhash,
             &params,
-            &stake_accounts_for_tx,
         );
         let tx_b64 = base64_encode(&tx);
 
@@ -838,10 +849,10 @@ fn cmd_sources() {
 
 fn cmd_balance() {
     let config = X1StrontiumConfig::load();
-    let keypair_path = match config.hot_signer_keypair_path.as_ref() {
+    let keypair_path = match config.oracle_keypair_path.as_ref() {
         Some(p) => p,
         None => {
-            eprintln!("config.hot_signer_keypair_path is not set");
+            eprintln!("config.oracle_keypair_path is not set");
             process::exit(1);
         }
     };
@@ -1131,14 +1142,15 @@ fn cmd_init(args: &[String]) {
     }
 
     let config = X1StrontiumConfig::load();
-    let kp_path = match authority_path.or_else(|| config.hot_signer_keypair_path.clone()) {
+    let kp_path = match authority_path.or_else(|| config.oracle_keypair_path.clone()) {
         Some(p) => p,
         None => {
             eprintln!(
                 "[init] no authority keypair — pass --authority <path> or set \
-                 `config.hot_signer_keypair_path`. Note: `init` creates the Oracle \
-                 State PDA (X1 Strontium admin op) and is distinct from per-operator \
-                 `initialize_operator` — the latter requires a Ledger, done via `solana` CLI."
+                 `config.oracle_keypair_path`. Note: `init` creates the Oracle \
+                 State PDA (X1 Strontium admin op, signed by the upgrade authority \
+                 keypair) and is distinct from per-operator registration — see \
+                 `x1-strontium register` for that."
             );
             process::exit(1);
         }
@@ -1220,6 +1232,255 @@ fn cmd_init(args: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
+// cmd_register — daemon-driven operator onboarding (v1.1)
+// ---------------------------------------------------------------------------
+//
+// Generates oracle.json if missing, loads vote.json, runs the off-chain
+// anti-farm gates (≥ 64 epoch credits, ≥ 128 XNT qualifying self-stake),
+// and on success builds + sends the 2-signer `register_submitter` TX.
+//
+// REFUSES to send if any gate fails — the contract holds no parsers in
+// v1.1, so the daemon is the sole enforcer of the operator-quality
+// constraint.
+
+fn cmd_register(args: &[String]) {
+    if !args.is_empty() {
+        eprintln!("usage: x1-strontium register");
+        process::exit(1);
+    }
+
+    let config = X1StrontiumConfig::load();
+
+    let oracle_path = match &config.oracle_keypair_path {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!(
+                "[register] config.oracle_keypair_path is not set — run \
+                 `x1-strontium config set oracle_keypair <path>` first"
+            );
+            process::exit(1);
+        }
+    };
+    let vote_path = match &config.vote_keypair_path {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!(
+                "[register] config.vote_keypair_path is not set — run \
+                 `x1-strontium config set vote_keypair <path>` first"
+            );
+            process::exit(1);
+        }
+    };
+
+    // Generate oracle keypair if missing. We never overwrite — if the file
+    // exists but is malformed, surface that as an error so the operator
+    // can decide what to do.
+    let expanded_oracle = expand_tilde(&oracle_path);
+    let oracle_keypair = if std::path::Path::new(&expanded_oracle).exists() {
+        match load_keypair(&oracle_path) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[register] cannot load existing oracle keypair: {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        println!("[register] generating fresh oracle keypair at {expanded_oracle}");
+        let kp = match generate_keypair() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[register] cannot generate keypair: {e}");
+                process::exit(1);
+            }
+        };
+        if let Err(e) = save_keypair(&expanded_oracle, &kp) {
+            eprintln!("[register] cannot save keypair: {e}");
+            process::exit(1);
+        }
+        kp
+    };
+
+    let vote_keypair = match load_keypair(&vote_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[register] cannot load vote keypair: {e}");
+            process::exit(1);
+        }
+    };
+
+    let oracle_pubkey: [u8; 32] = oracle_keypair.verifying_key().to_bytes();
+    let oracle_pubkey_b58 = bs58::encode(oracle_pubkey).into_string();
+    let vote_pubkey: [u8; 32] = vote_keypair.verifying_key().to_bytes();
+    let vote_pubkey_b58 = bs58::encode(vote_pubkey).into_string();
+
+    let mut program_id = [0u8; 32];
+    match bs58::decode(&config.program_id).into_vec() {
+        Ok(v) if v.len() == 32 => program_id.copy_from_slice(&v),
+        _ => {
+            eprintln!(
+                "[register] invalid program_id in config: {}",
+                config.program_id
+            );
+            process::exit(1);
+        }
+    }
+    let mut oracle_pda = [0u8; 32];
+    match bs58::decode(&config.oracle_pda).into_vec() {
+        Ok(v) if v.len() == 32 => oracle_pda.copy_from_slice(&v),
+        _ => {
+            eprintln!(
+                "[register] invalid oracle_pda in config: {}",
+                config.oracle_pda
+            );
+            process::exit(1);
+        }
+    }
+    let registration_pda = derive_registration_pda(&oracle_pubkey, &program_id);
+    let registration_pda_b58 = bs58::encode(registration_pda).into_string();
+
+    println!("[register] Oracle keypair:    {oracle_pubkey_b58}");
+    println!("[register] Vote keypair:      {vote_pubkey_b58}");
+    println!("[register] Registration PDA:  {registration_pda_b58}");
+    println!("[register] Oracle PDA:        {}", config.oracle_pda);
+    println!();
+    println!("[register] Off-chain anti-farm gates:");
+
+    let mut rpc = RpcClient::new(config.rpc_urls.clone());
+
+    // Gate 1: ≥ 64 epoch_credits entries on the validator's vote account.
+    let vote_account_data = match rpc.fetch_account_info(&vote_pubkey_b58) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[register] cannot fetch vote account: {e}");
+            process::exit(1);
+        }
+    };
+    let ec_len = match parse_vote_epoch_credits_len(&vote_account_data) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[register] cannot parse vote account: {e}");
+            process::exit(1);
+        }
+    };
+    if ec_len < MIN_EPOCH_HISTORY {
+        eprintln!(
+            "[register] ❌ epoch_credits has {ec_len} entries, need ≥ {MIN_EPOCH_HISTORY}. \
+             Validator is too young (~64 epochs ≈ 2 months of voting on X1). \
+             Wait a few days and retry."
+        );
+        process::exit(1);
+    }
+    println!("       ✓ epoch_credits = {ec_len} (≥ {MIN_EPOCH_HISTORY})");
+
+    // Gate 2: qualifying self-stake ≥ 128 XNT (filter voter / withdrawer /
+    // age ≥ 2 epochs / not deactivating, same as v1.0 contract logic).
+    if vote_account_data.len() < 68 {
+        eprintln!("[register] vote account too short — cannot read authorized_withdrawer");
+        process::exit(1);
+    }
+    let mut withdrawer = [0u8; 32];
+    withdrawer.copy_from_slice(&vote_account_data[36..68]);
+    println!(
+        "       authorized_withdrawer: {}",
+        bs58::encode(withdrawer).into_string()
+    );
+    let stake = match compute_self_stake_off_chain(&mut rpc, &vote_pubkey, &withdrawer) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[register] cannot compute self-stake: {e}");
+            process::exit(1);
+        }
+    };
+    if stake < MIN_SELF_STAKE_LAMPORTS {
+        eprintln!(
+            "[register] ❌ qualifying self-stake = {} XNT, need ≥ {} XNT. \
+             Filter: voter=this vote account, withdrawer=authorized_withdrawer, \
+             age ≥ 2 epochs, not deactivating.",
+            stake / 1_000_000_000,
+            MIN_SELF_STAKE_LAMPORTS / 1_000_000_000
+        );
+        process::exit(1);
+    }
+    println!(
+        "       ✓ qualifying self-stake = {} XNT (≥ {} XNT)",
+        stake / 1_000_000_000,
+        MIN_SELF_STAKE_LAMPORTS / 1_000_000_000
+    );
+    println!();
+
+    // Build + send register_submitter TX (oracle_keypair pays rent for
+    // the new ValidatorRegistration PDA; vote_keypair co-signs).
+    let blockhash = match rpc.get_recent_blockhash() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[register] blockhash error: {e}");
+            process::exit(1);
+        }
+    };
+    let tx = build_register_transaction(
+        &oracle_keypair,
+        &vote_keypair,
+        &program_id,
+        &oracle_pda,
+        &registration_pda,
+        &blockhash,
+    );
+    let tx_b64 = base64_encode(&tx);
+
+    println!("[register] Sending register_submitter ...");
+    match rpc.send_transaction(&tx_b64) {
+        Ok(sig) => {
+            println!("[register] ✅ Success — Signature: {sig}");
+            println!("[register] You can now start the daemon: `systemctl start x1-strontium`.");
+        }
+        Err(e) => {
+            eprintln!("[register] ❌ failed: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Generate a fresh ed25519 keypair from /dev/urandom — no extra deps,
+/// works on Linux + macOS (the daemon's targets).
+fn generate_keypair() -> Result<SigningKey, String> {
+    let mut file =
+        std::fs::File::open("/dev/urandom").map_err(|e| format!("open /dev/urandom: {e}"))?;
+    let mut bytes = [0u8; 32];
+    file.read_exact(&mut bytes)
+        .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    Ok(SigningKey::from_bytes(&bytes))
+}
+
+/// Persist a keypair in Solana's standard JSON-array-of-64-bytes format
+/// (32-byte secret seed followed by 32-byte public key). Sets the file
+/// mode to 0600 — the file holds a private key that signs every cycle.
+fn save_keypair(path: &str, keypair: &SigningKey) -> Result<(), String> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(64);
+    bytes.extend_from_slice(&keypair.to_bytes());
+    bytes.extend_from_slice(keypair.verifying_key().as_bytes());
+    let text = serde_json::to_string(&bytes).map_err(|e| format!("{e}"))?;
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, text).map_err(|e| format!("write {path}: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // cmd_read — decode the on-chain Oracle State PDA ring buffer
 // ---------------------------------------------------------------------------
 //
@@ -1247,7 +1508,7 @@ fn cmd_init(args: &[String]) {
 //     ring_count (u16 LE): struct +80..82    -> account +88..90
 //     n_operators        : struct +82..84    -> account +90..92
 //     _pad1 [4]          : struct +84..88    -> account +92..96
-//     _pad_reserve [8]   : struct +88..96    -> account +96..104
+//     last_cleanup_slot  : struct +88..96    -> account +96..104   (v1.1 — was _pad_reserve)
 //     submissions[6]     : struct +96..528   -> account +104..536   (6 × 72 B)
 //     ring_buffer[288]   : struct +528..9744 -> account +536..9752  (288 × 32 B)
 //
@@ -1537,24 +1798,31 @@ fn compute_self_stake_off_chain(
     Ok(total)
 }
 
-/// Same filtering as `compute_self_stake_off_chain` but returns the pubkeys
-/// of the qualifying stake accounts — the list the daemon attaches as
-/// `remaining_accounts` on the daily-recheck TX.
-fn fetch_qualifying_stakes(
+/// Cleanup pre-flight: fetch all active registrations and fire one
+/// `cleanup_inactive` TX that asks the contract to evaluate every one of
+/// them. The contract iterates the batch, marks any operator past the
+/// 10-missed-turns threshold as `is_active = false`, and stamps
+/// `last_cleanup_slot` so other daemons in the same cycle skip this work.
+fn try_cleanup_inactive(
     rpc: &mut RpcClient,
-    vote_pubkey: &[u8; 32],
-    authorized_withdrawer: &[u8; 32],
-) -> Result<Vec<[u8; 32]>, String> {
-    let stakes = rpc.fetch_stake_accounts_for_vote(vote_pubkey)?;
-    let epoch = rpc.get_epoch_info()?.epoch;
-    Ok(stakes
-        .into_iter()
-        .filter(|s| s.voter == *vote_pubkey)
-        .filter(|s| s.withdrawer == *authorized_withdrawer)
-        .filter(|s| epoch.saturating_sub(s.activation_epoch) >= 2)
-        .filter(|s| s.deactivation_epoch == u64::MAX)
-        .map(|s| s.pubkey)
-        .collect())
+    fee_payer: &SigningKey,
+    program_id: &[u8; 32],
+    oracle_pda: &[u8; 32],
+) -> Result<(), String> {
+    let regs: Vec<RegistrationEntry> = rpc.fetch_active_registrations(program_id)?;
+    if regs.is_empty() {
+        return Err("no active registrations to evaluate".to_string());
+    }
+    let blockhash = rpc.get_recent_blockhash()?;
+    let pdas: Vec<[u8; 32]> = regs.iter().map(|r| r.pda).collect();
+    let tx =
+        build_cleanup_inactive_transaction(fee_payer, program_id, oracle_pda, &pdas, &blockhash);
+    let sig = rpc.send_transaction(&base64_encode(&tx))?;
+    println!(
+        "[cleanup] fired cleanup_inactive (n={}) — tx: {sig}",
+        pdas.len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,19 +1880,23 @@ fn apply_tsc_correction(consensus_ms: i64, elapsed_ms: i64) -> i64 {
 mod tests {
     use super::*;
 
-    // ---------- Bug #1 tripwire: self-stake threshold ----------
+    // ---------- Self-stake threshold tripwire ----------
 
-    /// If someone changes the on-chain contract's `MIN_SELF_STAKE_LAMPORTS`
-    /// (currently 128 XNT) without updating this daemon's off-chain
-    /// early-warning threshold to match, the daemon would let operators
-    /// quietly drift below the on-chain floor and silently fail their next
-    /// 24 h stake recheck. This test locks the daemon-side value to the
-    /// literal 128 × 1e9 lamports. Keep in sync with
-    /// `programs/x1-strontium/src/lib.rs` `MIN_SELF_STAKE_LAMPORTS`.
+    /// In v1.1 the contract holds no parser — the daemon is the sole
+    /// enforcer of the 128 XNT qualifying-self-stake floor (off-chain
+    /// gate at register time and at the 24 h recheck). This test locks
+    /// the literal so a careless edit can't quietly weaken the gate.
     #[test]
-    fn min_self_stake_matches_contract_value() {
+    fn min_self_stake_is_128_xnt() {
         assert_eq!(MIN_SELF_STAKE_LAMPORTS, 128_000_000_000);
         assert_eq!(MIN_SELF_STAKE_LAMPORTS, 128 * 1_000_000_000);
+    }
+
+    #[test]
+    fn min_epoch_history_is_64() {
+        // Validator-age gate at register time. ~64 epochs ≈ 2 months on X1's
+        // epoch length. Off-chain only in v1.1.
+        assert_eq!(MIN_EPOCH_HISTORY, 64);
     }
 
     // ---------- next_boundary_sleep_ms math ----------

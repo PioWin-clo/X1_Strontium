@@ -43,10 +43,13 @@ pub const MEMO_PROGRAM_ID_B58: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfc
 /// stake accounts attached to `submit_time` TXs.
 pub const STAKE_PROGRAM_ID_B58: &str = "Stake11111111111111111111111111111111111111";
 
-/// Parsed view of a stake account (layout offsets validated in
-/// `programs/x1-strontium/tests/account_parse_integration.rs`).
+/// Parsed view of a stake account. The `pubkey` field is filled by
+/// `fetch_stake_accounts_for_vote` for callers that need to address the
+/// account on chain (cleanup paths, future RPC operations); v1.1's main
+/// loop only reads the filter fields, hence the dead-code allowance.
 #[derive(Debug, Clone)]
 pub struct StakeAccountInfo {
+    #[allow(dead_code)]
     pub pubkey: [u8; 32],
     pub withdrawer: [u8; 32],
     pub voter: [u8; 32],
@@ -62,16 +65,31 @@ pub struct EpochInfoResponse {
     pub absolute_slot: u64,
 }
 
-/// Minimal view of an `OperatorPDA` account — only the field the daemon
-/// actively consumes (`last_stake_check_slot`, used by the daily recheck
-/// gating in `main.rs`). The other fields (authority/Ledger, hot_signer,
-/// vote_account, validator_identity, self_stake_amount, active, bump) are
-/// either already known locally at startup or redundant with the off-chain
-/// self-stake computation. Expand when a new field is genuinely needed.
+/// Parsed view of a `ValidatorRegistration` account — every field the
+/// daemon parses, including a few not consumed by the current main loop
+/// but useful for `x1-strontium status` and future diagnostics.
 #[derive(Debug, Clone)]
-pub struct OperatorInfo {
-    pub last_stake_check_slot: u64,
+#[allow(dead_code)]
+pub struct RegistrationEntry {
+    /// The registration PDA address. Used as a `remaining_accounts`
+    /// entry when the daemon calls `cleanup_inactive`.
+    pub pda: [u8; 32],
+    pub oracle_keypair: [u8; 32],
+    pub vote_account: [u8; 32],
+    pub registered_at: i64,
+    pub last_submitted_window_id: u64,
+    pub is_active: bool,
 }
+
+/// On-chain account layout for `ValidatorRegistration` (Anchor `#[account]`,
+/// 8-byte discriminator + 88-byte body). All offsets below are absolute
+/// from the start of the account data (including the discriminator).
+const REG_ACCOUNT_SIZE: usize = 96;
+const REG_OFF_ORACLE: usize = 8;
+const REG_OFF_VOTE: usize = 40;
+const REG_OFF_REGISTERED_AT: usize = 72;
+const REG_OFF_LAST_WINDOW: usize = 80;
+const REG_OFF_IS_ACTIVE: usize = 88;
 
 /// Native lamports → XNT (X1 Native Token) conversion. 1 XNT = 1e9 lamports.
 const LAMPORTS_PER_XNT: f64 = 1_000_000_000.0;
@@ -108,11 +126,13 @@ pub fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> ([u8; 32]
     panic!("find_program_address: no off-curve hash found (statistically impossible)");
 }
 
-/// v1.0 operator PDA derivation. Seeds: `[b"operator", vote_account]` —
-/// bound to the validator's vote account, not to any daemon-side keypair.
-/// One operator per validator; PDA collision makes duplicates impossible.
-pub fn derive_operator_pda(vote_account: &[u8; 32], program_id: &[u8; 32]) -> [u8; 32] {
-    let (pda, _bump) = find_program_address(&[b"operator", vote_account], program_id);
+/// v1.1 registration PDA derivation. Seeds: `[b"reg", oracle_keypair]` —
+/// bound to the daemon-side oracle keypair (the key that signs
+/// `submit_time` every cycle). One registration per oracle keypair, so
+/// rotation = generate fresh keypair, register again; the contract
+/// auto-cleans the old one after 10 missed turns.
+pub fn derive_registration_pda(oracle_keypair: &[u8; 32], program_id: &[u8; 32]) -> [u8; 32] {
+    let (pda, _bump) = find_program_address(&[b"reg", oracle_keypair], program_id);
     pda
 }
 
@@ -455,15 +475,15 @@ impl RpcClient {
         })
     }
 
-    /// `getProgramAccounts` against the X1 Strontium v1.0 program, filtered
-    /// to accounts of size `8 + OperatorPDA::LEN = 168` bytes and with
-    /// `active == true`. Returns the list of **hot_signer pubkeys** — that's
-    /// the identity the rotation state tracks (it's what signs `submit_time`
-    /// and therefore what each daemon uses to find itself in the fleet).
-    pub fn fetch_active_operators(
+    /// `getProgramAccounts` against the X1 Strontium v1.1 program, filtered
+    /// to accounts of size `8 + ValidatorRegistration::LEN = 96` bytes.
+    /// Returns every active registration with the full body parsed. Used
+    /// for rotation membership (`oracle_keypair`) and for `cleanup_inactive`
+    /// (`pda` + `last_submitted_window_id`).
+    pub fn fetch_active_registrations(
         &mut self,
         program_id: &[u8; 32],
-    ) -> Result<Vec<[u8; 32]>, String> {
+    ) -> Result<Vec<RegistrationEntry>, String> {
         let pid_b58 = bs58::encode(program_id).into_string();
         self.rpc_call_with_retry(|url| {
             let body = serde_json::json!({
@@ -476,7 +496,7 @@ impl RpcClient {
                         "encoding": "base64",
                         "commitment": "confirmed",
                         "filters": [
-                            { "dataSize": 168u64 }
+                            { "dataSize": REG_ACCOUNT_SIZE as u64 }
                         ]
                     }
                 ]
@@ -491,21 +511,12 @@ impl RpcClient {
                 .pointer("/result")
                 .and_then(|x| x.as_array())
                 .ok_or_else(|| format!("getProgramAccounts shape: {resp}"))?;
-            // OperatorPDA layout inside the account body (after the 8-byte
-            // Anchor discriminator — so account-level offsets below are
-            // struct_offset + 8):
-            //   [  8.. 40]  authority            (Pubkey — Ledger)
-            //   [ 40.. 72]  hot_signer           (Pubkey — daemon signer)
-            //   [ 72..104]  vote_account         (Pubkey)
-            //   [104..136]  validator_identity   (Pubkey)
-            //   [136..144]  registered_at        (i64)
-            //   [144..152]  last_stake_check_slot(u64)
-            //   [152..160]  self_stake_amount    (u64)
-            //   [160     ]  active               (bool)
-            //   [161     ]  bump                 (u8)
-            //   [162..168]  _pad
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
+                let pk_b58 = match item.pointer("/pubkey").and_then(|x| x.as_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 let data_b64 = match item.pointer("/account/data/0").and_then(|x| x.as_str()) {
                     Some(s) => s,
                     None => continue,
@@ -514,50 +525,116 @@ impl RpcClient {
                     Some(d) => d,
                     None => continue,
                 };
-                if data.len() < 168 {
+                if data.len() < REG_ACCOUNT_SIZE {
                     continue;
                 }
-                let active = data[160] != 0;
-                if !active {
+                if data[REG_OFF_IS_ACTIVE] == 0 {
                     continue;
                 }
-                let mut hot = [0u8; 32];
-                hot.copy_from_slice(&data[40..72]);
-                out.push(hot);
+                let pk_raw = match bs58::decode(pk_b58).into_vec() {
+                    Ok(v) if v.len() == 32 => v,
+                    _ => continue,
+                };
+                let mut pda = [0u8; 32];
+                pda.copy_from_slice(&pk_raw);
+                let mut oracle = [0u8; 32];
+                oracle.copy_from_slice(&data[REG_OFF_ORACLE..REG_OFF_VOTE]);
+                let mut vote = [0u8; 32];
+                vote.copy_from_slice(&data[REG_OFF_VOTE..REG_OFF_REGISTERED_AT]);
+                let registered_at = i64::from_le_bytes(
+                    data[REG_OFF_REGISTERED_AT..REG_OFF_LAST_WINDOW]
+                        .try_into()
+                        .unwrap(),
+                );
+                let last_submitted_window_id = u64::from_le_bytes(
+                    data[REG_OFF_LAST_WINDOW..REG_OFF_IS_ACTIVE]
+                        .try_into()
+                        .unwrap(),
+                );
+                out.push(RegistrationEntry {
+                    pda,
+                    oracle_keypair: oracle,
+                    vote_account: vote,
+                    registered_at,
+                    last_submitted_window_id,
+                    is_active: true,
+                });
             }
             Ok(out)
         })
     }
 
-    /// Fetch a single `OperatorPDA` account and parse the field the daemon
-    /// needs for its 24 h self-stake recheck gate.
-    ///
-    /// Account layout (with 8-byte Anchor discriminator prefix — so
-    /// account-level offsets below are struct_offset + 8):
-    ///   [  8.. 40]  authority (Pubkey)
-    ///   [ 40.. 72]  hot_signer (Pubkey)
-    ///   [ 72..104]  vote_account (Pubkey)
-    ///   [104..136]  validator_identity (Pubkey)
-    ///   [136..144]  registered_at (i64)
-    ///   [144..152]  last_stake_check_slot (u64)   ← used here
-    ///   [152..160]  self_stake_amount (u64)
-    ///   [160     ]  active (bool)
-    ///   [161     ]  bump (u8)
-    ///   [162..168]  _pad
-    pub fn fetch_operator(&mut self, operator_pda: &[u8; 32]) -> Result<OperatorInfo, String> {
-        let data = self.fetch_account_info(&bs58::encode(operator_pda).into_string())?;
-        if data.len() < 168 {
+    /// Fetch a single `ValidatorRegistration` PDA. The daemon calls this on
+    /// its own registration to detect being cleaned up (e.g. after a long
+    /// silent period — `is_active = false` means it must re-register).
+    pub fn fetch_registration(&mut self, reg_pda: &[u8; 32]) -> Result<RegistrationEntry, String> {
+        let data = self.fetch_account_info(&bs58::encode(reg_pda).into_string())?;
+        if data.len() < REG_ACCOUNT_SIZE {
             return Err(format!(
-                "OperatorPDA account too small: {} bytes (expected ≥ 168)",
+                "ValidatorRegistration account too small: {} bytes (expected {REG_ACCOUNT_SIZE})",
                 data.len()
             ));
         }
-        let last_stake_check_slot =
-            u64::from_le_bytes(data[144..152].try_into().map_err(|e| format!("{e}"))?);
-        Ok(OperatorInfo {
-            last_stake_check_slot,
+        let mut oracle = [0u8; 32];
+        oracle.copy_from_slice(&data[REG_OFF_ORACLE..REG_OFF_VOTE]);
+        let mut vote = [0u8; 32];
+        vote.copy_from_slice(&data[REG_OFF_VOTE..REG_OFF_REGISTERED_AT]);
+        let registered_at = i64::from_le_bytes(
+            data[REG_OFF_REGISTERED_AT..REG_OFF_LAST_WINDOW]
+                .try_into()
+                .map_err(|e| format!("{e}"))?,
+        );
+        let last_submitted_window_id = u64::from_le_bytes(
+            data[REG_OFF_LAST_WINDOW..REG_OFF_IS_ACTIVE]
+                .try_into()
+                .map_err(|e| format!("{e}"))?,
+        );
+        let is_active = data[REG_OFF_IS_ACTIVE] != 0;
+        Ok(RegistrationEntry {
+            pda: *reg_pda,
+            oracle_keypair: oracle,
+            vote_account: vote,
+            registered_at,
+            last_submitted_window_id,
+            is_active,
         })
     }
+
+    /// Fetch the OracleState account header — the daemon reads
+    /// `n_operators` for rotation math and `last_cleanup_slot` for the
+    /// cleanup pre-flight throttle.
+    pub fn fetch_oracle_state_header(
+        &mut self,
+        oracle_pda: &[u8; 32],
+    ) -> Result<OracleStateHeader, String> {
+        let data = self.fetch_account_info(&bs58::encode(oracle_pda).into_string())?;
+        if data.len() < 96 {
+            return Err(format!(
+                "OracleState account too small: {} bytes (expected >= 96 for header)",
+                data.len()
+            ));
+        }
+        // Header offsets after the 8-byte Anchor discriminator:
+        //   [82..84]  n_operators (u16)
+        //   [88..96]  last_cleanup_slot (u64)
+        let n_operators = u16::from_le_bytes(data[82..84].try_into().unwrap());
+        let last_cleanup_slot = u64::from_le_bytes(data[88..96].try_into().unwrap());
+        Ok(OracleStateHeader {
+            n_operators,
+            last_cleanup_slot,
+        })
+    }
+}
+
+/// Subset of `OracleState` the daemon actively reads at runtime.
+/// `n_operators` is parsed alongside `last_cleanup_slot` for the same
+/// header read; main loop currently only consumes `last_cleanup_slot`
+/// for the cleanup throttle.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct OracleStateHeader {
+    pub n_operators: u16,
+    pub last_cleanup_slot: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +691,11 @@ pub struct SubmitParams<'a> {
     /// 50 ms spread budget (fallback). The contract instruction and the
     /// memo's `{prefix}=` field both use this value, so they always agree.
     pub precise_time_ms: i64,
+    /// The daemon's `SystemTime::now()` (UTC ms) captured at the moment the
+    /// consensus was computed — i.e. before TSC correction. Recorded for
+    /// the memo's `sys=` and `sysdrift=` fields, which signal the health of
+    /// the daemon's underlying system clock relative to the NTP consensus.
+    pub sys_at_consensus_ms: i64,
 }
 
 fn best_stratum(consensus: &ConsensusResult) -> u8 {
@@ -653,13 +735,17 @@ fn time_source_prefix(consensus: &ConsensusResult) -> &'static str {
 }
 
 fn build_memo(params: &SubmitParams) -> String {
-    // Memo v1: the v0.5 STAMP suffix (ppm/off/tsc/ent/stamp) has been removed
-    // wholesale in v1.0. `drift` is the signed delta between our precise
-    // estimate and the on-chain `Clock::unix_timestamp` (positive = chain is
-    // behind, negative = ahead; the X1 chain has historically run 12–20 s
-    // behind real UTC).
+    // Memo v1 (still v1 — protocol-level identifier, not codebase version).
+    // `drift` is the signed delta between our precise consensus estimate
+    // and the on-chain `Clock::unix_timestamp` (positive = chain is behind,
+    // negative = ahead; X1 chain has historically run 12–20 s behind real
+    // UTC). v1.1 adds `sys=` (daemon's system clock at consensus moment)
+    // and `sysdrift=` (precise vs sys), exposing the daemon's local clock
+    // health alongside the chain drift signal.
     let prefix = time_source_prefix(params.consensus);
     let time_str = format_clock_3dec(params.precise_time_ms);
+    let sys_str = format_clock_3dec(params.sys_at_consensus_ms);
+    let sysdrift = params.precise_time_ms - params.sys_at_consensus_ms;
     let (chain_str, drift_str) = match params.chain_time_ms {
         Some(t) => (
             format_clock_3dec(t),
@@ -669,18 +755,20 @@ fn build_memo(params: &SubmitParams) -> String {
     };
     let conf = (params.consensus.confidence * 100.0).round() as u32;
 
-    // Example with NTS sources:
-    //   X1Strontium:v1:w=5921961:nts=08:45:00.003:chain=08:45:00.000:drift=3:
-    //   c=97:s=10:st=1
-    // Length ~100 bytes — well under the 566 B Memo Program limit.
+    // Example:
+    //   X1Strontium:v1:w=5921961:nts=08:45:00.003:sys=08:45:00.005:
+    //   chain=08:45:00.000:drift=3:sysdrift=-2:c=97:s=10:st=1
+    // Length ~120 bytes — well under the 566 B Memo Program limit.
     format!(
-        "X1Strontium:v1:w={w}:{prefix}={time}:chain={chain}:drift={drift}:\
-         c={c}:s={s}:st={st}",
+        "X1Strontium:v1:w={w}:{prefix}={time}:sys={sys}:chain={chain}:\
+         drift={drift}:sysdrift={sysdrift}:c={c}:s={s}:st={st}",
         w = params.window_id,
         prefix = prefix,
         time = time_str,
+        sys = sys_str,
         chain = chain_str,
         drift = drift_str,
+        sysdrift = sysdrift,
         c = conf,
         s = params.consensus.sources_used,
         st = best_stratum(params.consensus),
@@ -702,75 +790,34 @@ fn write_compact(buf: &mut Vec<u8>, n: u16) {
 }
 
 /// Build and sign a `submit_time` Anchor transaction (optionally with a
-/// Memo instruction). Signer = `hot_signer`. The daemon holds exactly one
-/// signer — there is no second validator-identity signer.
-///
-/// - `vote_account`: required — the validator's vote account, read-only in
-///   the instruction for the cheap liveness heuristic and as PDA seed
-///   source for `operator_pda`.
-/// - `stake_accounts`: optional remaining_accounts — passed only when the
-///   daily stake recheck window is approaching. Empty slice = no recheck.
-#[allow(clippy::too_many_arguments)]
+/// Memo instruction). Signer = `oracle_keypair`. v1.1 contract: the
+/// instruction touches only `oracle_state` and the caller's own
+/// `registration` PDA — no vote account, no stake remaining_accounts.
 pub fn build_submit_transaction_signed(
     keypair: &SigningKey,
     program_id: &[u8; 32],
     oracle_pda: &[u8; 32],
-    operator_pda: &[u8; 32],
-    vote_account: &[u8; 32],
+    registration_pda: &[u8; 32],
     blockhash: &[u8; 32],
     params: &SubmitParams,
-    stake_accounts: &[[u8; 32]],
 ) -> Vec<u8> {
     let signer_pubkey: [u8; 32] = keypair.verifying_key().to_bytes();
     let memo_program =
         pubkey_from_b58(MEMO_PROGRAM_ID_B58).expect("memo program id is constant and valid");
 
-    // Defensive dedup of stake_accounts against the fixed account set and
-    // against each other. Even a single duplicate anywhere in the message
-    // makes Solana runtime reject the TX with AccountLoadedTwice before the
-    // contract runs.
-    let mut fixed_set: Vec<[u8; 32]> = vec![
-        signer_pubkey,
-        *oracle_pda,
-        *operator_pda,
-        *vote_account,
-        *program_id,
-    ];
-    if params.memo_enabled {
-        fixed_set.push(memo_program);
-    }
-    let mut dedup_stakes: Vec<[u8; 32]> = Vec::with_capacity(stake_accounts.len());
-    for sa in stake_accounts {
-        if fixed_set.contains(sa) || dedup_stakes.contains(sa) {
-            continue;
-        }
-        dedup_stakes.push(*sa);
-    }
-
     // Account ordering (Solana message header convention):
-    //   writable_signed   = [hot_signer]                 (pays fees)
+    //   writable_signed   = [oracle_keypair]                 (pays fees)
     //   readonly_signed   = []
-    //   writable_unsigned = [oracle_pda, operator_pda]   (both mutated)
-    //   readonly_unsigned = [vote_account, *dedup_stakes, program_id (+ memo?)]
+    //   writable_unsigned = [oracle_pda, registration_pda]   (both mutated)
+    //   readonly_unsigned = [program_id, memo_program?]
     let mut ordered_keys: Vec<[u8; 32]> =
-        vec![signer_pubkey, *oracle_pda, *operator_pda, *vote_account];
-    for sa in &dedup_stakes {
-        ordered_keys.push(*sa);
-    }
-    ordered_keys.push(*program_id);
+        vec![signer_pubkey, *oracle_pda, *registration_pda, *program_id];
     if params.memo_enabled {
         ordered_keys.push(memo_program);
     }
     let num_required_signatures: u8 = 1;
     let num_readonly_signed: u8 = 0;
-    let num_readonly_unsigned: u8 = {
-        let base = 1 /* vote */ + dedup_stakes.len() as u8 + 1 /* program_id */;
-        if params.memo_enabled {
-            base + 1
-        } else {
-            base
-        }
-    };
+    let num_readonly_unsigned: u8 = if params.memo_enabled { 2 } else { 1 };
 
     let idx = |key: &[u8; 32]| -> u8 {
         ordered_keys
@@ -779,13 +826,9 @@ pub fn build_submit_transaction_signed(
             .expect("ordered_keys must contain all referenced accounts") as u8
     };
 
-    // ---- Instruction 1: submit_time ----
-    // Timestamp written on chain is `precise_time_ms` (= consensus timestamp
-    // + TSC elapsed for the build/sign/RPC pipeline, with fallback to raw
-    // consensus when elapsed > 50 ms). Memo's `{prefix}=` field uses the
-    // same value, so the on-chain instruction and memo always agree.
+    // ---- Instruction 1: submit_time(SubmitTimeArgs) ----
     let discriminator = anchor_discriminator("submit_time");
-    let mut ix1_data: Vec<u8> = Vec::with_capacity(8 + 8 + 2 + 1 + 1 + 4);
+    let mut ix1_data: Vec<u8> = Vec::with_capacity(8 + 8 + 2 + 1 + 1 + 8);
     ix1_data.extend_from_slice(&discriminator);
     ix1_data.extend_from_slice(&params.precise_time_ms.to_le_bytes());
     ix1_data.extend_from_slice(&(params.consensus.spread_ms as i16).to_le_bytes());
@@ -796,18 +839,8 @@ pub fn build_submit_transaction_signed(
     ix1_data.push(conf_pct);
     ix1_data.extend_from_slice(&params.consensus.sources_bitmap.to_le_bytes());
 
-    // SubmitTime Anchor derive order:
-    //   oracle_state, operator_pda, vote_account, submitter
-    //   + remaining_accounts = stakes (only at 24 h recheck)
-    let mut ix1_accounts: Vec<u8> = vec![
-        idx(oracle_pda),
-        idx(operator_pda),
-        idx(vote_account),
-        idx(&signer_pubkey),
-    ];
-    for sa in &dedup_stakes {
-        ix1_accounts.push(idx(sa));
-    }
+    // SubmitTime Anchor derive order: oracle_state, registration, submitter
+    let ix1_accounts: Vec<u8> = vec![idx(oracle_pda), idx(registration_pda), idx(&signer_pubkey)];
     let ix1_program_id_index = idx(program_id);
 
     // ---- Optional Instruction 2: Memo ----
@@ -834,27 +867,195 @@ pub fn build_submit_transaction_signed(
     let n_instructions: u16 = if params.memo_enabled { 2 } else { 1 };
     write_compact(&mut msg, n_instructions);
 
-    // Instruction 1 wire format
     msg.push(ix1_program_id_index);
     write_compact(&mut msg, ix1_accounts.len() as u16);
     msg.extend_from_slice(&ix1_accounts);
     write_compact(&mut msg, ix1_data.len() as u16);
     msg.extend_from_slice(&ix1_data);
 
-    // Instruction 2 (memo)
     if let Some(memo_idx) = memo_program_idx {
         msg.push(memo_idx);
-        write_compact(&mut msg, 0); // memo takes no accounts
+        write_compact(&mut msg, 0);
         write_compact(&mut msg, memo_bytes.len() as u16);
         msg.extend_from_slice(memo_bytes);
     }
 
-    // ---- Sign ----
     let sig = keypair.sign(&msg).to_bytes();
 
-    // ---- Wrap as transaction ----
     let mut tx = Vec::with_capacity(64 + msg.len() + 4);
-    write_compact(&mut tx, 1); // 1 signature
+    write_compact(&mut tx, 1);
+    tx.extend_from_slice(&sig);
+    tx.extend_from_slice(&msg);
+    tx
+}
+
+/// Build and sign a `register_submitter` Anchor transaction. Two signers
+/// are required: the freshly funded `oracle_keypair` (which pays rent for
+/// the new `ValidatorRegistration` PDA) and the validator's `vote_keypair`
+/// (which co-signs as proof that the operator controls both halves of the
+/// system). The contract performs no vote-account validation — the daemon
+/// must enforce the off-chain anti-farm gates (epoch credits, qualifying
+/// self-stake) BEFORE building this TX.
+pub fn build_register_transaction(
+    oracle_keypair: &SigningKey,
+    vote_keypair: &SigningKey,
+    program_id: &[u8; 32],
+    oracle_pda: &[u8; 32],
+    registration_pda: &[u8; 32],
+    blockhash: &[u8; 32],
+) -> Vec<u8> {
+    let oracle_pubkey: [u8; 32] = oracle_keypair.verifying_key().to_bytes();
+    let vote_pubkey: [u8; 32] = vote_keypair.verifying_key().to_bytes();
+
+    // Account ordering:
+    //   writable_signed   = [oracle_keypair]                  (pays fees + rent)
+    //   readonly_signed   = [vote_keypair]                    (co-signs only)
+    //   writable_unsigned = [registration_pda, oracle_pda]    (both mutated)
+    //   readonly_unsigned = [program_id, system_program]
+    let ordered_keys: Vec<[u8; 32]> = vec![
+        oracle_pubkey,
+        vote_pubkey,
+        *registration_pda,
+        *oracle_pda,
+        *program_id,
+        SYSTEM_PROGRAM_ID,
+    ];
+    let num_required_signatures: u8 = 2;
+    let num_readonly_signed: u8 = 1;
+    let num_readonly_unsigned: u8 = 2;
+
+    let idx = |key: &[u8; 32]| -> u8 {
+        ordered_keys
+            .iter()
+            .position(|k| k == key)
+            .expect("ordered_keys must contain all referenced accounts") as u8
+    };
+
+    // RegisterSubmitter Anchor derive order:
+    //   registration, oracle_state, oracle_keypair, vote_keypair, system_program
+    let discriminator = anchor_discriminator("register_submitter");
+    let ix_data: Vec<u8> = discriminator.to_vec();
+    let ix_accounts: Vec<u8> = vec![
+        idx(registration_pda),
+        idx(oracle_pda),
+        idx(&oracle_pubkey),
+        idx(&vote_pubkey),
+        idx(&SYSTEM_PROGRAM_ID),
+    ];
+    let ix_program_id_index = idx(program_id);
+
+    let mut msg = Vec::with_capacity(256);
+    msg.push(num_required_signatures);
+    msg.push(num_readonly_signed);
+    msg.push(num_readonly_unsigned);
+
+    write_compact(&mut msg, ordered_keys.len() as u16);
+    for k in &ordered_keys {
+        msg.extend_from_slice(k);
+    }
+    msg.extend_from_slice(blockhash);
+
+    write_compact(&mut msg, 1);
+    msg.push(ix_program_id_index);
+    write_compact(&mut msg, ix_accounts.len() as u16);
+    msg.extend_from_slice(&ix_accounts);
+    write_compact(&mut msg, ix_data.len() as u16);
+    msg.extend_from_slice(&ix_data);
+
+    let sig_oracle = oracle_keypair.sign(&msg).to_bytes();
+    let sig_vote = vote_keypair.sign(&msg).to_bytes();
+
+    let mut tx = Vec::with_capacity(64 * 2 + msg.len() + 4);
+    write_compact(&mut tx, 2);
+    tx.extend_from_slice(&sig_oracle);
+    tx.extend_from_slice(&sig_vote);
+    tx.extend_from_slice(&msg);
+    tx
+}
+
+/// Build and sign a `cleanup_inactive` Anchor transaction with a batch of
+/// candidate `ValidatorRegistration` PDAs in `remaining_accounts` (all
+/// passed as writable). The fee payer is also the lone signer; the
+/// instruction itself takes no signer-derived state, so any caller can
+/// invoke it. The contract iterates the batch, marks any operator that
+/// has missed strictly more than `MAX_MISSED_TURNS` of their own rotation
+/// turns as `is_active = false`, and recomputes `n_operators` /
+/// `quorum_threshold` / `last_cleanup_slot` accordingly.
+pub fn build_cleanup_inactive_transaction(
+    fee_payer: &SigningKey,
+    program_id: &[u8; 32],
+    oracle_pda: &[u8; 32],
+    registration_pdas: &[[u8; 32]],
+    blockhash: &[u8; 32],
+) -> Vec<u8> {
+    let payer_pubkey: [u8; 32] = fee_payer.verifying_key().to_bytes();
+
+    // Defensive dedup of registration_pdas against the fixed account set
+    // and against each other (AccountLoadedTwice rejects the TX otherwise).
+    let mut fixed: Vec<[u8; 32]> = vec![payer_pubkey, *oracle_pda, *program_id];
+    let mut regs: Vec<[u8; 32]> = Vec::with_capacity(registration_pdas.len());
+    for r in registration_pdas {
+        if fixed.contains(r) || regs.contains(r) {
+            continue;
+        }
+        regs.push(*r);
+    }
+    fixed.extend_from_slice(&regs);
+    let _ = fixed; // silence unused after dedup; ordered_keys is the real list
+
+    // Account ordering:
+    //   writable_signed   = [fee_payer]
+    //   readonly_signed   = []
+    //   writable_unsigned = [oracle_pda, *regs]
+    //   readonly_unsigned = [program_id]
+    let mut ordered_keys: Vec<[u8; 32]> = vec![payer_pubkey, *oracle_pda];
+    for r in &regs {
+        ordered_keys.push(*r);
+    }
+    ordered_keys.push(*program_id);
+
+    let num_required_signatures: u8 = 1;
+    let num_readonly_signed: u8 = 0;
+    let num_readonly_unsigned: u8 = 1;
+
+    let idx = |key: &[u8; 32]| -> u8 {
+        ordered_keys
+            .iter()
+            .position(|k| k == key)
+            .expect("ordered_keys must contain all referenced accounts") as u8
+    };
+
+    // CleanupInactive Anchor derive order: oracle_state + remaining_accounts
+    let discriminator = anchor_discriminator("cleanup_inactive");
+    let ix_data: Vec<u8> = discriminator.to_vec();
+    let mut ix_accounts: Vec<u8> = vec![idx(oracle_pda)];
+    for r in &regs {
+        ix_accounts.push(idx(r));
+    }
+    let ix_program_id_index = idx(program_id);
+
+    let mut msg = Vec::with_capacity(256 + 32 * regs.len());
+    msg.push(num_required_signatures);
+    msg.push(num_readonly_signed);
+    msg.push(num_readonly_unsigned);
+
+    write_compact(&mut msg, ordered_keys.len() as u16);
+    for k in &ordered_keys {
+        msg.extend_from_slice(k);
+    }
+    msg.extend_from_slice(blockhash);
+
+    write_compact(&mut msg, 1);
+    msg.push(ix_program_id_index);
+    write_compact(&mut msg, ix_accounts.len() as u16);
+    msg.extend_from_slice(&ix_accounts);
+    write_compact(&mut msg, ix_data.len() as u16);
+    msg.extend_from_slice(&ix_data);
+
+    let sig = fee_payer.sign(&msg).to_bytes();
+
+    let mut tx = Vec::with_capacity(64 + msg.len() + 4);
+    write_compact(&mut tx, 1);
     tx.extend_from_slice(&sig);
     tx.extend_from_slice(&msg);
     tx
@@ -927,11 +1128,84 @@ pub fn build_initialize_transaction(
     tx
 }
 
-// Note: operator onboarding is out-of-scope for the daemon. The contract's
-// `initialize_operator` / `rotate_hot_signer` / `deactivate_operator` /
-// `close_operator` instructions are all Ledger-signed (cold key = vote
-// account's authorized_withdrawer). Operators run `solana` CLI + Ledger
-// out-of-band. See docs/OPERATOR_ONBOARDING.md.
+// Operator onboarding in v1.1 is daemon-driven: `cmd_register` builds the
+// `register_submitter` TX after enforcing the off-chain anti-farm gates
+// (epoch credits ≥ 64, qualifying self-stake ≥ 128 XNT). The operator's
+// hardware wallet (Ledger / Trezor / etc.) is invoked exactly once,
+// out-of-band, to fund the freshly generated `oracle_keypair` via native
+// `solana transfer`. See docs/OPERATOR_ONBOARDING.md.
+
+// ---------------------------------------------------------------------------
+// Vote-account parsing helpers (off-chain anti-farm gate)
+// ---------------------------------------------------------------------------
+
+/// Walk a `VoteStateVersions::Current` body to read the `epoch_credits`
+/// length. The daemon enforces the ≥ 64-epoch anti-farm gate at register
+/// time before sending `register_submitter`; the contract itself holds no
+/// vote-account parser.
+///
+/// Byte offsets match the bincode serialisation rules validated against
+/// live X1 mainnet during v1.0 development. Variable-length sections are
+/// walked rather than peeked (votes VecDeque, root_slot Option,
+/// authorized_voters BTreeMap, prior_voters fixed CircBuf).
+pub fn parse_vote_epoch_credits_len(data: &[u8]) -> Result<u64, String> {
+    if data.len() < 69 {
+        return Err(format!("vote account too small: {} bytes", data.len()));
+    }
+    let tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if tag != 2 {
+        return Err(format!(
+            "unsupported VoteStateVersions tag {tag} (expected 2 = Current)"
+        ));
+    }
+
+    let mut off: usize = 69;
+
+    // votes: VecDeque<LandedVote> — u64 len + len × 13
+    if data.len() < off + 8 {
+        return Err("vote account truncated at votes".to_string());
+    }
+    let votes_len = u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as usize;
+    off = off.checked_add(8).ok_or("offset overflow at votes")?;
+    let votes_bytes = votes_len.checked_mul(13).ok_or("votes_len overflow")?;
+    off = off
+        .checked_add(votes_bytes)
+        .ok_or("offset overflow past votes")?;
+
+    // root_slot: Option<Slot>
+    if data.len() < off + 1 {
+        return Err("vote account truncated at root_slot".to_string());
+    }
+    let root_tag = data[off];
+    off = off.checked_add(1).ok_or("offset overflow at root tag")?;
+    if root_tag == 1 {
+        off = off
+            .checked_add(8)
+            .ok_or("offset overflow at root payload")?;
+    } else if root_tag != 0 {
+        return Err(format!("unknown root_slot Option tag: {root_tag}"));
+    }
+
+    // authorized_voters: BTreeMap<Epoch, Pubkey> — u64 len + len × 40
+    if data.len() < off + 8 {
+        return Err("vote account truncated at authorized_voters".to_string());
+    }
+    let av_len = u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as usize;
+    off = off.checked_add(8).ok_or("offset overflow at av")?;
+    let av_bytes = av_len.checked_mul(40).ok_or("av_len overflow")?;
+    off = off.checked_add(av_bytes).ok_or("offset overflow past av")?;
+
+    // prior_voters: CircBuf<(Pubkey, Epoch, Epoch), 32> — fixed 1545 B
+    off = off
+        .checked_add(1545)
+        .ok_or("offset overflow at prior_voters")?;
+
+    // epoch_credits: Vec<(Epoch, u64, u64)> — u64 len follows
+    if data.len() < off + 8 {
+        return Err("vote account truncated at epoch_credits".to_string());
+    }
+    Ok(u64::from_le_bytes(data[off..off + 8].try_into().unwrap()))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1070,6 +1344,9 @@ mod tests {
             memo_enabled: true,
             chain_time_ms,
             precise_time_ms,
+            // Default to sys = precise + 5 ms — gives a stable, non-zero
+            // sysdrift in tests. Override per-test where needed.
+            sys_at_consensus_ms: precise_time_ms + 5,
         }
     }
 
@@ -1198,7 +1475,34 @@ mod tests {
         );
     }
 
-    /// Regression test mandated by the v1.0 rebuild mission: the STAMP
+    #[test]
+    fn memo_v1_has_sys_fields() {
+        // v1.1 mandate: every memo carries `sys=HH:MM:SS.mmm` and
+        // `sysdrift=N` so stat sites can monitor each operator's local
+        // system-clock health alongside the chain drift.
+        let c = mock_consensus(vec![mock_source(NtpTier::Stratum1, "s1.x", 1)], false);
+        // precise = 1_713_184_500_003, sys = precise + 5 = 1_713_184_500_008
+        // ⇒ sysdrift = precise - sys = -5
+        let p = mock_params(&c, Some(1_713_184_500_000), 1_713_184_500_003);
+        let memo = build_memo(&p);
+        assert!(memo.contains(":sys="), "missing :sys= field in: {memo}");
+        assert!(
+            memo.contains(":sysdrift=-5:"),
+            "expect :sysdrift=-5: in: {memo}"
+        );
+
+        // Override sys to be earlier than precise — sysdrift should flip
+        // sign (positive = NTP consensus is ahead of system clock).
+        let mut p2 = mock_params(&c, Some(1_713_184_500_000), 1_713_184_500_003);
+        p2.sys_at_consensus_ms = 1_713_184_499_990; // 13 ms before precise
+        let memo2 = build_memo(&p2);
+        assert!(
+            memo2.contains(":sysdrift=13:"),
+            "expect :sysdrift=13: in: {memo2}"
+        );
+    }
+
+    /// Regression test mandated by the rebuild mission: the v0.5 STAMP
     /// memo fields (`:ppm=`, `:off=`, `:tsc=`, `:ent=`, `:stamp=`) must
     /// never reappear. If anyone re-adds a STAMP measurement path and
     /// accidentally wires it back into the memo, this test fails loudly.
