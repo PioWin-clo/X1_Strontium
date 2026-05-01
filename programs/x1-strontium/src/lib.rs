@@ -82,6 +82,15 @@ pub const MAX_SPREAD_MS: i64 = 50;
 /// rotation turns in a row gets `is_active = false` set by `cleanup_inactive`.
 pub const MAX_MISSED_TURNS: u8 = 10;
 
+/// Bootstrap-mode threshold: the oracle reports `is_degraded = 1`
+/// regardless of per-window quorum and confidence whenever the active
+/// operator fleet is below this size. Below 3 operators a single (or
+/// pair of) honest submitters cannot be cross-validated by enough
+/// peers; dApps should treat the reading as untrusted and fall back to
+/// `Clock::unix_timestamp` (or whatever their bootstrap-safe path is)
+/// until enough independent operators register.
+pub const MIN_QUORUM_ABSOLUTE: u16 = 3;
+
 // ---- PDA seeds ----
 
 pub const ORACLE_STATE_SEED: &[u8] = b"X1";
@@ -193,10 +202,16 @@ pub mod x1_strontium {
         let reg = &mut ctx.accounts.registration;
         let state = &mut ctx.accounts.oracle_state.load_mut()?;
 
-        // Window reset.
+        // Window reset. Eagerly mark the oracle as degraded — aggregate()
+        // will flip is_degraded back to 0 only when quorum and confidence
+        // pass in the new window. Without this, a window that loses
+        // quorum would inherit `is_degraded = 0` from the prior
+        // successful aggregation and `read_time` would return a stale
+        // reading without erroring with OracleDegraded.
         if slot.saturating_sub(state.window_start_slot) >= WINDOW_SLOTS {
             state.window_start_slot = slot;
             state.submission_count = 0;
+            state.is_degraded = 1;
             for s in state.submissions.iter_mut() {
                 *s = ValidatorSubmission::zeroed();
             }
@@ -204,6 +219,10 @@ pub mod x1_strontium {
         require!(
             (state.submission_count as usize) < MAX_SUBMISSIONS,
             X1StrontiumError::SubmissionsFull
+        );
+        require!(
+            !submitter_already_in_window(state, &ctx.accounts.submitter.key()),
+            X1StrontiumError::DuplicateSubmissionInWindow
         );
 
         let new_sub = ValidatorSubmission {
@@ -390,6 +409,19 @@ pub fn missed_own_turns(
     windows_since / wpt
 }
 
+/// Has this submitter already pushed a submission into the current window?
+/// Used by `submit_time` to reject double-submits from the same operator
+/// — letting both through would corrupt the median by counting one
+/// operator's value twice.
+pub fn submitter_already_in_window(state: &OracleState, submitter: &Pubkey) -> bool {
+    let n = state.submission_count as usize;
+    state
+        .submissions
+        .iter()
+        .take(n)
+        .any(|s| s.validator == *submitter)
+}
+
 // ---------------------------------------------------------------------------
 // Aggregation (median — same philosophy as v1.0, Bug #2 fix preserved)
 // ---------------------------------------------------------------------------
@@ -427,6 +459,13 @@ fn aggregate(state: &mut OracleState, slot: u64) {
         } else {
             1
         };
+    // Bootstrap-mode override: even when per-window quorum and confidence
+    // pass, the oracle is degraded until the operator fleet reaches
+    // MIN_QUORUM_ABSOLUTE. Forces dApps off the oracle's reading whenever
+    // the network is too small to provide meaningful cross-validation.
+    if state.n_operators < MIN_QUORUM_ABSOLUTE {
+        state.is_degraded = 1;
+    }
 
     let ring_spread = state.spread_ms.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
     let new_entry = RingEntry {
@@ -743,6 +782,8 @@ pub enum X1StrontiumError {
     ConfidenceTooLow,
     #[msg("Submission slots full for the current window")]
     SubmissionsFull,
+    #[msg("This operator already submitted in the current window")]
+    DuplicateSubmissionInWindow,
     #[msg("Oracle is in degraded state — quorum not met")]
     OracleDegraded,
     #[msg("Oracle data is older than the requested staleness window")]
@@ -970,6 +1011,7 @@ mod tests {
         // inside aggregate() the slice is [100, 150, 200] and the median at
         // index n/2 == 1 is 150.
         let mut state = zeroed_state();
+        state.n_operators = 3; // at MIN_QUORUM_ABSOLUTE — bootstrap override inactive
         state.quorum_threshold = 3;
         state.submission_count = 3;
         state.submissions[0].timestamp_ms = 100;
@@ -1043,5 +1085,133 @@ mod tests {
         assert_eq!(state.ring_buffer[1].slot, 300);
         assert_eq!(state.ring_buffer[0].trusted_time_ms, 1_000);
         assert_eq!(state.ring_buffer[1].trusted_time_ms, 2_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.1.1 patch regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn submit_time_rejects_duplicate_validator_in_same_window() {
+        // Fix #3: a validator that already pushed a submission into the
+        // current window must be detected as a duplicate. The on-chain
+        // `submit_time` reads this via `submitter_already_in_window` and
+        // returns DuplicateSubmissionInWindow — the host-side test
+        // exercises the helper directly (full instruction harness lives
+        // outside cargo test --lib).
+        let alice = Pubkey::new_from_array([0xa1u8; 32]);
+        let bob = Pubkey::new_from_array([0xb2u8; 32]);
+        let mut state = zeroed_state();
+        state.submission_count = 1;
+        state.submissions[0].validator = alice;
+
+        assert!(
+            submitter_already_in_window(&state, &alice),
+            "alice already in submissions[0] — must be detected as duplicate"
+        );
+        assert!(
+            !submitter_already_in_window(&state, &bob),
+            "bob hasn't submitted in this window"
+        );
+
+        // Boundary: an entry written into submissions[1] but not yet
+        // counted (submission_count still = 1) must NOT be matched.
+        // Otherwise stale data from a prior aborted submit would
+        // permanently lock that submitter out.
+        state.submissions[1].validator = bob;
+        assert!(
+            !submitter_already_in_window(&state, &bob),
+            "bob's stale entry beyond submission_count must be ignored"
+        );
+    }
+
+    #[test]
+    fn aggregate_marks_degraded_when_n_operators_below_min_absolute() {
+        // Fix #2: bootstrap mode. With n_operators=2 the per-window
+        // quorum + confidence checks would normally clear is_degraded,
+        // but the absolute-minimum override forces is_degraded=1 until
+        // the fleet reaches MIN_QUORUM_ABSOLUTE=3 operators.
+        let mut state = zeroed_state();
+        state.n_operators = 2;
+        state.quorum_threshold = 1; // required_quorum(2) = 1
+        state.submission_count = 2;
+        state.submissions[0].timestamp_ms = 1_700_000_000_000;
+        state.submissions[0].confidence_pct = 95;
+        state.submissions[1].timestamp_ms = 1_700_000_000_010;
+        state.submissions[1].confidence_pct = 95;
+
+        aggregate(&mut state, 1_000);
+
+        assert_eq!(
+            state.is_degraded, 1,
+            "expected is_degraded=1 with n_operators=2 < MIN_QUORUM_ABSOLUTE=3"
+        );
+        // Median + last slot are still updated — only the trust signal
+        // is degraded, the aggregation itself runs normally so historical
+        // entries land in the ring buffer.
+        assert_ne!(state.trusted_time_ms, 0);
+        assert_eq!(state.last_updated_slot, 1_000);
+    }
+
+    #[test]
+    fn aggregate_clears_degraded_when_n_operators_at_or_above_min_absolute() {
+        // Fix #2: at or above MIN_QUORUM_ABSOLUTE the bootstrap override
+        // is inactive and the per-window quorum + confidence semantics
+        // determine is_degraded normally.
+        let mut state = zeroed_state();
+        state.n_operators = 3;
+        state.quorum_threshold = 1; // required_quorum(3) = 1
+        state.submission_count = 3;
+        state.submissions[0].timestamp_ms = 1_700_000_000_000;
+        state.submissions[0].confidence_pct = 95;
+        state.submissions[1].timestamp_ms = 1_700_000_000_005;
+        state.submissions[1].confidence_pct = 95;
+        state.submissions[2].timestamp_ms = 1_700_000_000_010;
+        state.submissions[2].confidence_pct = 95;
+
+        aggregate(&mut state, 1_000);
+
+        assert_eq!(
+            state.is_degraded, 0,
+            "expected is_degraded=0 with n_operators=3 = MIN_QUORUM_ABSOLUTE"
+        );
+    }
+
+    #[test]
+    fn is_degraded_resets_to_one_on_window_boundary() {
+        // Fix #1: every window reset in submit_time eagerly sets
+        // is_degraded = 1. aggregate() is the only path that clears it
+        // back to 0, and it only runs once the new window reaches
+        // quorum_threshold. Without this reset, a window with sub-quorum
+        // submissions would inherit is_degraded = 0 from a prior
+        // successful aggregation and read_time would silently return a
+        // stale reading.
+        let mut state = zeroed_state();
+        state.is_degraded = 0; // previous window aggregated successfully
+        state.window_start_slot = 100;
+        state.submission_count = 3; // previous window had submissions
+        state.quorum_threshold = 2;
+
+        // Replicate the window-reset block from submit_time at a slot past
+        // window_start_slot + WINDOW_SLOTS. The fix is the line setting
+        // is_degraded = 1 inside this block.
+        let new_slot = 100 + WINDOW_SLOTS;
+        if new_slot.saturating_sub(state.window_start_slot) >= WINDOW_SLOTS {
+            state.window_start_slot = new_slot;
+            state.submission_count = 0;
+            state.is_degraded = 1;
+            for s in state.submissions.iter_mut() {
+                *s = ValidatorSubmission::zeroed();
+            }
+        }
+        // One operator submits in the new window, but quorum_threshold = 2,
+        // so aggregate() does not run and is_degraded stays at 1.
+        state.submission_count = 1;
+
+        assert_eq!(
+            state.is_degraded, 1,
+            "expected is_degraded=1 after window reset with submissions below quorum"
+        );
+        assert_eq!(state.submission_count, 1);
     }
 }

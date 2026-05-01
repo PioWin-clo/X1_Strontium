@@ -69,6 +69,13 @@ Retired (closed on chain) v0.5 Program ID for reference only:
 at `EQ9CgHkx34AL7gaBHSX9nEWbwBtEfktbVGyQWEsTEtEy` is orphan post-v1.1
 upgrade — its 0.07 XNT of rent stays locked there forever.
 
+**Bootstrap mode (v1.1.1+).** Strontium reports `is_degraded = 1`
+regardless of per-window quorum and confidence whenever the active
+operator fleet is below `MIN_QUORUM_ABSOLUTE = 3`. dApps should treat
+`is_degraded = 1` as a signal to fall back to alternate time sources
+(e.g. `Clock::unix_timestamp` or another oracle) until enough
+independent operators register.
+
 ---
 
 ## For dApp developers: reading the time

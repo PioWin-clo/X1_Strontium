@@ -70,6 +70,13 @@ pod adresem `EQ9CgHkx34AL7gaBHSX9nEWbwBtEfktbVGyQWEsTEtEy` jest
 osierocony po upgrade'ie do v1.1 — jego 0,07 XNT renty zostaje
 zablokowane tam na zawsze.
 
+**Tryb bootstrap (v1.1.1+).** Strontium raportuje `is_degraded = 1`
+niezależnie od per-okna quorum i confidence dopóki aktywna pula
+operatorów jest mniejsza niż `MIN_QUORUM_ABSOLUTE = 3`. dApps powinny
+traktować `is_degraded = 1` jako sygnał do fallbacku na alternatywne
+źródła czasu (np. `Clock::unix_timestamp` lub inny oracle) dopóki
+dołączy wystarczająco niezależnych operatorów.
+
 ---
 
 ## Dla deweloperów dApp: odczyt czasu

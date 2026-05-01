@@ -51,6 +51,13 @@ const MIN_SELF_STAKE_LAMPORTS: u64 = 128_000_000_000;
 /// 2 months of consistent voting on X1's epoch length).
 const MIN_EPOCH_HISTORY: u64 = 64;
 
+/// Maximum allowed delta in milliseconds between the NTP-derived
+/// consensus timestamp and the daemon's local system clock at the
+/// consensus moment. Beyond this, the host's system clock is suspected
+/// of being broken and the cycle silences itself rather than push a
+/// garbage timestamp on chain.
+const MAX_SYSDRIFT_MS: i64 = 5000;
+
 fn print_help() {
     println!(
         "\
@@ -111,7 +118,7 @@ fn main() {
                 eprintln!(
                     "x1-strontium already running (pids: {existing:?}); stopping before restart"
                 );
-                kill_pids(&existing, 3);
+                kill_pids(&existing, 10);
             }
             if let Err(e) = run_daemon(config) {
                 eprintln!("daemon error: {e}");
@@ -531,10 +538,17 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             continue;
         }
 
-        // j. Outlier check vs SYSTEM clock (NOT chain clock — chain drifts ~14s).
-        let local_now_ms = get_system_clock_ms();
-        if (consensus.timestamp_ms - local_now_ms).abs() > 5000 {
-            update_status_silent(&mut status, &config, SilentReason::TimestampOutlier);
+        // j. Sysdrift gate vs SYSTEM clock (NOT chain — chain time has no
+        //    economic security and is unreliable as a reference). Reuse
+        //    `sys_at_consensus_ms` captured right after consensus in step
+        //    f. so the same value reported in the memo's `sys=` field is
+        //    the one we gate on. If sys clock at consensus moment was off
+        //    by more than MAX_SYSDRIFT_MS from the consensus value, the
+        //    daemon's system clock is broken (mis-disciplined chrony /
+        //    systemd-timesyncd, or no time daemon at all) — silence
+        //    rather than push a garbage timestamp on chain.
+        if (consensus.timestamp_ms - sys_at_consensus_ms).abs() > MAX_SYSDRIFT_MS {
+            update_status_silent(&mut status, &config, SilentReason::SystemClockOutOfSync);
             sleep(Duration::from_secs(config.interval_s));
             continue;
         }
@@ -829,7 +843,7 @@ fn cmd_stop() {
             "found {} additional x1-strontium process(es): {others:?}",
             others.len()
         );
-        kill_pids(&others, 3);
+        kill_pids(&others, 10);
         println!("all x1-strontium processes terminated");
     }
     status.running = false;
@@ -1973,6 +1987,50 @@ mod tests {
         assert!(
             (150..=200).contains(&elapsed),
             "expected elapsed ~150 ms, got {elapsed} ms"
+        );
+    }
+
+    // ---------- v1.1.1 patch: sysdrift gate ----------
+
+    #[test]
+    fn daemon_silences_when_sysdrift_exceeds_threshold() {
+        // Fix #4: when the daemon's system clock drifts more than
+        // MAX_SYSDRIFT_MS from the NTP consensus, main loop step j
+        // silences the cycle with SilentReason::SystemClockOutOfSync
+        // rather than submitting a garbage timestamp. The full main
+        // loop is exercised in integration; here we lock the threshold
+        // arithmetic directly so an accidental change to the constant
+        // or to the comparison fails loudly.
+        let consensus_ms: i64 = 1_000_000_000;
+
+        // 10 s behind consensus → |drift| = 10000 > 5000 → silence.
+        let sys_drifted_back: i64 = 999_990_000;
+        assert!(
+            (consensus_ms - sys_drifted_back).abs() > MAX_SYSDRIFT_MS,
+            "10s behind consensus must trigger silence"
+        );
+
+        // 10 s ahead of consensus → silence as well (sign-symmetric).
+        let sys_drifted_forward: i64 = 1_000_010_000;
+        assert!(
+            (consensus_ms - sys_drifted_forward).abs() > MAX_SYSDRIFT_MS,
+            "10s ahead of consensus must trigger silence"
+        );
+
+        // 4.999 s drift — under threshold, daemon submits.
+        let sys_close: i64 = consensus_ms + 4_999;
+        assert!(
+            (consensus_ms - sys_close).abs() <= MAX_SYSDRIFT_MS,
+            "4.999s drift must NOT trigger silence"
+        );
+
+        // Boundary: exactly 5000 ms drift. The gate uses strict `>`, so
+        // an exact-match drift is acceptable.
+        let sys_at_limit: i64 = consensus_ms + 5_000;
+        assert_eq!((consensus_ms - sys_at_limit).abs(), MAX_SYSDRIFT_MS);
+        assert!(
+            (consensus_ms - sys_at_limit).abs() <= MAX_SYSDRIFT_MS,
+            "drift exactly at MAX_SYSDRIFT_MS must NOT trigger silence (strict >)"
         );
     }
 }
