@@ -1,0 +1,101 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-musl-${{ hashFiles('Cargo.lock', 'daemon/Cargo.toml') }}
+
+      - name: Build daemon (static musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p x1-strontium-daemon
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/x1-strontium
+
+      - name: Verify ABI (statically linked, runs, prints help)
+        run: |
+          file target/x86_64-unknown-linux-musl/release/x1-strontium
+          file target/x86_64-unknown-linux-musl/release/x1-strontium | grep -q 'statically linked' \
+            || (echo "ABI verify failed: not statically linked"; exit 1)
+          ls -lh target/x86_64-unknown-linux-musl/release/x1-strontium
+          ./target/x86_64-unknown-linux-musl/release/x1-strontium --help | head -3
+
+      - name: Stage release artifacts (final asset names + sha256)
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/x1-strontium x1-strontium-linux-x86_64
+          sha256sum x1-strontium-linux-x86_64 > x1-strontium.sha256
+          cat x1-strontium.sha256
+          ls -lh x1-strontium-linux-x86_64
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            VERSION=$(grep '^version' daemon/Cargo.toml | head -1 | cut -d'"' -f2)
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "tag=v${VERSION}-${SHORT_SHA}-build" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "X1 Strontium ${{ steps.tag.outputs.tag }}"
+          make_latest: "true"
+          generate_release_notes: true
+          body: |
+            ## X1 Strontium — Decentralized Time Oracle for X1
+
+            Static musl binary — works on Ubuntu 18/20/22/24, Debian, CentOS, dowolny Linux x86_64. Bez zależności GLIBC.
+
+            ### Install
+            ```
+            wget https://github.com/PioWin-clo/X1_Strontium/releases/latest/download/x1-strontium-linux-x86_64
+            wget https://github.com/PioWin-clo/X1_Strontium/releases/latest/download/x1-strontium.sha256
+            sha256sum -c x1-strontium.sha256  # verify
+            chmod +x x1-strontium-linux-x86_64
+            sudo mv x1-strontium-linux-x86_64 /usr/local/bin/x1-strontium
+            sudo ln -sf /usr/local/bin/x1-strontium /usr/local/bin/x1sr
+            x1sr --help
+            ```
+
+            ### On-chain deployment (mainnet)
+            - Program ID: `2thzsm9z31MPEvDWHuuSGqAcjrr5ek4pS78EgPAT4Fch`
+            - Oracle State PDA: `cfm1Tc7CNdTa8Hm8FGWAuHXaaozSjQHNmdBD5mEVN9P`
+            - Last deploy slot: 46716147
+          files: |
+            x1-strontium-linux-x86_64
+            x1-strontium.sha256
