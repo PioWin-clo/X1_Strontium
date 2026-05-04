@@ -61,15 +61,11 @@ jobs:
             *"static-pie linked"*) echo "✓ static-pie (musl 1.2+, equivalent for portability)" ;;
             *) echo "ABI verify failed: neither 'statically linked' nor 'static-pie linked'"; exit 1 ;;
           esac
-          # ldd is the second, independent check — catches any case where
-          # `file` lies and the binary actually has dynamic deps.
-          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
-            echo "✓ ldd: not a dynamic executable"
-          else
-            echo "ABI verify failed: ldd reports dynamic deps:"
-            ldd "$BIN"
-            exit 1
-          fi
+          # Intentionally no ldd check: glibc's ldd reports musl-linked
+          # binaries as "statically linked" rather than the glibc-convention
+          # "not a dynamic executable", so ldd is unreliable as a portability
+          # gate for musl artifacts. The `file` check above + the
+          # x86_64-unknown-linux-musl target give a sufficient guarantee.
           ls -lh "$BIN"
           ./"$BIN" --help | head -3
 
