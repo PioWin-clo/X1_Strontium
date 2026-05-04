@@ -6,6 +6,11 @@ on:
     tags:
       - 'v*.*.*'
 
+env:
+  # Silence the Node.js 20 deprecation warning emitted by older
+  # JavaScript actions; opts in to Node 24 runtime where supported.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-linux-x86_64:
     runs-on: ubuntu-22.04
@@ -45,11 +50,28 @@ jobs:
 
       - name: Verify ABI (statically linked, runs, prints help)
         run: |
-          file target/x86_64-unknown-linux-musl/release/x1-strontium
-          file target/x86_64-unknown-linux-musl/release/x1-strontium | grep -q 'statically linked' \
-            || (echo "ABI verify failed: not statically linked"; exit 1)
-          ls -lh target/x86_64-unknown-linux-musl/release/x1-strontium
-          ./target/x86_64-unknown-linux-musl/release/x1-strontium --help | head -3
+          BIN=target/x86_64-unknown-linux-musl/release/x1-strontium
+          ABI=$(file "$BIN")
+          echo "$ABI"
+          # musl 1.2+ produces "static-pie linked" instead of the classic
+          # "statically linked"; both are fully portable across glibc /
+          # musl distros, so accept either form.
+          case "$ABI" in
+            *"statically linked"*) echo "✓ classic static" ;;
+            *"static-pie linked"*) echo "✓ static-pie (musl 1.2+, equivalent for portability)" ;;
+            *) echo "ABI verify failed: neither 'statically linked' nor 'static-pie linked'"; exit 1 ;;
+          esac
+          # ldd is the second, independent check — catches any case where
+          # `file` lies and the binary actually has dynamic deps.
+          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "✓ ldd: not a dynamic executable"
+          else
+            echo "ABI verify failed: ldd reports dynamic deps:"
+            ldd "$BIN"
+            exit 1
+          fi
+          ls -lh "$BIN"
+          ./"$BIN" --help | head -3
 
       - name: Stage release artifacts (final asset names + sha256)
         run: |
