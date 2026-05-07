@@ -45,8 +45,8 @@ pub const STAKE_PROGRAM_ID_B58: &str = "Stake11111111111111111111111111111111111
 
 /// Parsed view of a stake account. The `pubkey` field is filled by
 /// `fetch_stake_accounts_for_vote` for callers that need to address the
-/// account on chain (cleanup paths, future RPC operations); v1.1's main
-/// loop only reads the filter fields, hence the dead-code allowance.
+/// account on chain (cleanup paths, future RPC operations); the daemon
+/// main loop only reads the filter fields, hence the dead-code allowance.
 #[derive(Debug, Clone)]
 pub struct StakeAccountInfo {
     #[allow(dead_code)]
@@ -126,7 +126,7 @@ pub fn find_program_address(seeds: &[&[u8]], program_id: &[u8; 32]) -> ([u8; 32]
     panic!("find_program_address: no off-curve hash found (statistically impossible)");
 }
 
-/// v1.1 registration PDA derivation. Seeds: `[b"reg", oracle_keypair]` —
+/// Registration PDA derivation. Seeds: `[b"reg", oracle_keypair]` —
 /// bound to the daemon-side oracle keypair (the key that signs
 /// `submit_time` every cycle). One registration per oracle keypair, so
 /// rotation = generate fresh keypair, register again; the contract
@@ -170,16 +170,33 @@ impl RpcClient {
     {
         let mut last_err = String::from("no rpc endpoints configured");
         let now = Self::now_secs();
+        // Track the first endpoint that failed in this call so a
+        // successful fallback can log it (debug-only, gated by
+        // X1SR_DEBUG env var to avoid noisy production logs). The error
+        // log fires only when ALL endpoints fail (the final Err return).
+        let mut first_failed: Option<String> = None;
+
         for i in 0..self.urls.len() {
             if self.cooldown_until[i] > now {
                 continue;
             }
             match op(&self.urls[i]) {
                 Ok(v) => {
+                    if let Some(failed) = &first_failed {
+                        if std::env::var("X1SR_DEBUG").is_ok() {
+                            eprintln!(
+                                "[rpc] fallback: {failed} unreachable, using {}",
+                                self.urls[i]
+                            );
+                        }
+                    }
                     self.fail_counts[i] = 0;
                     return Ok(v);
                 }
                 Err(e) => {
+                    if first_failed.is_none() {
+                        first_failed = Some(self.urls[i].clone());
+                    }
                     last_err = e;
                     self.fail_counts[i] += 1;
                     if self.fail_counts[i] >= 3 {
@@ -475,7 +492,7 @@ impl RpcClient {
         })
     }
 
-    /// `getProgramAccounts` against the X1 Strontium v1.1 program, filtered
+    /// `getProgramAccounts` against the X1 Strontium program, filtered
     /// to accounts of size `8 + ValidatorRegistration::LEN = 96` bytes.
     /// Returns every active registration with the full body parsed. Used
     /// for rotation membership (`oracle_keypair`) and for `cleanup_inactive`
@@ -670,7 +687,7 @@ fn anchor_discriminator(name: &str) -> [u8; 8] {
 /// Earlier revisions multiplied `ms * 10` to fake a 4-digit field, but that was
 /// misleading: a value like `26.4090` reads as "26.4 seconds" rather than
 /// "26 s + 409 ms". Three digits matches ISO-8601 fractional-second convention.
-fn format_clock_3dec(unix_ms: i64) -> String {
+pub fn format_clock_3dec(unix_ms: i64) -> String {
     let secs = unix_ms.div_euclid(1000);
     let ms = unix_ms.rem_euclid(1000) as u64;
     let h = ((secs / 3600) % 24) as u64;
@@ -739,9 +756,9 @@ fn build_memo(params: &SubmitParams) -> String {
     // `drift` is the signed delta between our precise consensus estimate
     // and the on-chain `Clock::unix_timestamp` (positive = chain is behind,
     // negative = ahead; X1 chain has historically run 12–20 s behind real
-    // UTC). v1.1 adds `sys=` (daemon's system clock at consensus moment)
-    // and `sysdrift=` (precise vs sys), exposing the daemon's local clock
-    // health alongside the chain drift signal.
+    // UTC). The `sys=` field reports the daemon's system clock at the
+    // consensus moment and `sysdrift=` reports precise vs sys, exposing
+    // the daemon's local clock health alongside the chain drift signal.
     let prefix = time_source_prefix(params.consensus);
     let time_str = format_clock_3dec(params.precise_time_ms);
     let sys_str = format_clock_3dec(params.sys_at_consensus_ms);
@@ -790,7 +807,7 @@ fn write_compact(buf: &mut Vec<u8>, n: u16) {
 }
 
 /// Build and sign a `submit_time` Anchor transaction (optionally with a
-/// Memo instruction). Signer = `oracle_keypair`. v1.1 contract: the
+/// Memo instruction). Signer = `oracle_keypair`. The contract
 /// instruction touches only `oracle_state` and the caller's own
 /// `registration` PDA — no vote account, no stake remaining_accounts.
 pub fn build_submit_transaction_signed(
@@ -1128,9 +1145,9 @@ pub fn build_initialize_transaction(
     tx
 }
 
-// Operator onboarding in v1.1 is daemon-driven: `cmd_register` builds the
+// Operator onboarding is daemon-driven: `cmd_register` builds the
 // `register_submitter` TX after enforcing the off-chain anti-farm gates
-// (epoch credits ≥ 64, qualifying self-stake ≥ 128 XNT). The operator's
+// (epoch credits ≥ 64 + withdrawer-match qualifying stake). The operator's
 // hardware wallet (Ledger / Trezor / etc.) is invoked exactly once,
 // out-of-band, to fund the freshly generated `oracle_keypair` via native
 // `solana transfer`. See docs/OPERATOR_ONBOARDING.md.
@@ -1221,12 +1238,19 @@ pub fn lamports_to_xnt(lamports: u64) -> f64 {
 /// output, so any future fee change touches one place only.
 pub const COST_PER_TX_XNT: f64 = 0.004;
 
-pub fn estimate_days_remaining(balance_xnt: f64, interval_s: u64) -> f64 {
+/// Days of fee runway given a balance, interval, and fleet size.
+///
+/// In a fleet of `n_operators` the rotation gives each operator on
+/// average `1/n` of the windows, so daily TX cost scales as
+/// `cost_per_tx * (86400/interval) / n`. `n_operators = 0` is treated
+/// as 1 (defensive — solo estimate).
+pub fn estimate_days_remaining(balance_xnt: f64, interval_s: u64, n_operators: u16) -> f64 {
     if balance_xnt <= 0.0 || interval_s == 0 {
         return 0.0;
     }
+    let n = n_operators.max(1) as f64;
     let tx_per_day: f64 = 86_400.0 / interval_s as f64;
-    let daily_cost = COST_PER_TX_XNT * tx_per_day;
+    let daily_cost = COST_PER_TX_XNT * tx_per_day / n;
     if daily_cost <= 0.0 {
         return f64::INFINITY;
     }
@@ -1477,7 +1501,7 @@ mod tests {
 
     #[test]
     fn memo_v1_has_sys_fields() {
-        // v1.1 mandate: every memo carries `sys=HH:MM:SS.mmm` and
+        // Mandate: every memo carries `sys=HH:MM:SS.mmm` and
         // `sysdrift=N` so stat sites can monitor each operator's local
         // system-clock health alongside the chain drift.
         let c = mock_consensus(vec![mock_source(NtpTier::Stratum1, "s1.x", 1)], false);
@@ -1539,5 +1563,54 @@ mod tests {
                 "banned STAMP field `{banned}` found in memo (memo_disabled path): {memo2}"
             );
         }
+    }
+
+    // ---------- Fix 1 (v1.2.0): runway scales with fleet size ----------
+
+    #[test]
+    fn estimate_days_remaining_solo_baseline_is_one_day_per_1152xnt() {
+        // Solo (n=1): every window is mine. At 5-min cadence:
+        //   tx_per_day = 86400/300 = 288
+        //   daily_cost = 0.004 * 288 / 1 = 1.152 XNT/day
+        //   1.152 XNT balance ⇒ exactly 1.0 day.
+        let runway = estimate_days_remaining(1.152, 300, 1);
+        assert!(
+            (runway - 1.0).abs() < 0.001,
+            "expected ~1.0 day runway, got {runway}"
+        );
+    }
+
+    #[test]
+    fn estimate_days_remaining_doubles_when_fleet_doubles() {
+        // n=2: each operator pays for half the windows. Same balance
+        // funds twice as long.
+        let solo = estimate_days_remaining(1.152, 300, 1);
+        let pair = estimate_days_remaining(1.152, 300, 2);
+        assert!(
+            (pair / solo - 2.0).abs() < 0.01,
+            "expected pair/solo ratio ~2.0, got {}",
+            pair / solo
+        );
+    }
+
+    #[test]
+    fn estimate_days_remaining_zero_n_treated_as_solo() {
+        // Defensive: a caller passing n_operators = 0 must not divide
+        // by zero — clamp to 1 (solo estimate).
+        let solo = estimate_days_remaining(1.152, 300, 1);
+        let zero = estimate_days_remaining(1.152, 300, 0);
+        assert_eq!(solo, zero);
+    }
+
+    #[test]
+    fn estimate_days_remaining_large_fleet_extends_runway() {
+        // n=100: ~100x runway vs solo (small rounding from f64 arithmetic).
+        let solo = estimate_days_remaining(1.152, 300, 1);
+        let big = estimate_days_remaining(1.152, 300, 100);
+        assert!(
+            (big / solo - 100.0).abs() < 0.5,
+            "expected ~100x runway, got ratio {}",
+            big / solo
+        );
     }
 }

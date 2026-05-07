@@ -17,13 +17,13 @@ fn validate_pubkey_str(s: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-// X1 Strontium v1.1 mainnet — file-based oracle.json model. Program ID is
-// preserved from v1.0 (in-place upgrade via `solana program deploy
-// --program-id <existing>`); the OracleState PDA changes because v1.1
-// uses 4-segment seeds (`["X1","Strontium","v1","oracle"]`) so the v1.0
-// PDA at `EQ9CgHkx...` becomes orphan. Hosts with cached config.json from
-// v1.0 should run `x1-strontium config set oracle_pda <v1.1>` or delete
-// the cached file to pick up these defaults.
+// X1 Strontium v1.2.0 mainnet — file-based oracle.json model. Program ID
+// is preserved across upgrades (in-place via `solana program deploy
+// --program-id <existing>`); the OracleState PDA uses 4-segment seeds
+// (`["X1","Strontium","v1","oracle"]`) so the v1.0 PDA at `EQ9CgHkx...`
+// is orphan. Hosts with a cached config.json from a prior version should
+// `x1-strontium config set oracle_pda <current>` or delete the cached
+// file to pick up these defaults.
 pub const PROGRAM_ID: &str = "2thzsm9z31MPEvDWHuuSGqAcjrr5ek4pS78EgPAT4Fch";
 /// Derived via `find_program_address(["X1","Strontium","v1","oracle"],
 /// PROGRAM_ID)`, bump = 255. The first successful `x1-strontium init`
@@ -174,7 +174,7 @@ impl X1StrontiumConfig {
     }
 
     pub fn display(&self) {
-        println!("X1 Strontium — config (v1.1)");
+        println!("X1 Strontium — config (v1.2.0)");
         println!("  interval_s:                  {}", self.interval_s);
         println!(
             "  oracle_keypair_path:         {}",

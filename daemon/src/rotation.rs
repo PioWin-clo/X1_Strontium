@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Per-window submission buffer size — **must match** the on-chain
 /// contract's `MAX_SUBMISSIONS`. Shrunk to 6 in the v0.4 hotfix to fit X1's
 /// 10 240 B CPI realloc cap; if you change this, also change the const in
@@ -63,26 +61,10 @@ impl RotationState {
     }
 }
 
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Decide whether this node is electing itself for the current window.
-/// Returns `(is_my_turn, window_id, secs_until_next_window)`.
-///
-/// Thin wrapper over [`rotation_my_turn_at`] — all the actual logic lives
-/// there as a pure function so unit tests can pass an arbitrary `now`.
-pub fn rotation_my_turn(my_index: usize, n_oracles: usize, interval_s: u64) -> (bool, u64, u64) {
-    let now = unix_secs();
-    rotation_my_turn_at(my_index, n_oracles, interval_s, now)
-}
-
-/// Pure rotation election: same logic as [`rotation_my_turn`] but the
-/// wall-clock `now` is injected so tests can replay any window/elapsed
-/// combination deterministically.
+/// Pure rotation election: `now` (UNIX seconds) is injected so the
+/// daemon can pass `next_boundary_secs` (so the election decision
+/// matches the actual submit moment) and tests can replay any
+/// window/elapsed combination deterministically.
 ///
 /// Three regimes depending on fleet size `n`:
 ///
@@ -157,14 +139,20 @@ pub fn rotation_my_turn_at(
     }
 }
 
-/// Has *anything* already been submitted in the current window?
-/// Used to skip a redundant submit after a process restart.
-pub fn window_has_submission(last_submit_ts: Option<i64>, interval_s: u64) -> bool {
+/// Has *anything* already been submitted in the window enclosing
+/// `now_secs`? Used by the daemon's pre-poll flow to gate on the
+/// upcoming boundary (`now = next_boundary`) so a process restart
+/// mid-cycle doesn't cause a double submit.
+pub fn window_has_submission_at(
+    last_submit_ts: Option<i64>,
+    interval_s: u64,
+    now_secs: i64,
+) -> bool {
     match last_submit_ts {
         Some(ts) if ts > 0 => {
             let interval = interval_s.max(1) as i64;
             let last_window = ts / interval;
-            let now_window = (unix_secs() as i64) / interval;
+            let now_window = now_secs / interval;
             last_window == now_window
         }
         _ => false,
@@ -341,5 +329,45 @@ mod tests {
             coverage.iter().all(|&c| c),
             "every operator should be eligible in at least one of 43 windows"
         );
+    }
+
+    // ---------- window_has_submission_at (Fix 6 / v1.2.0) ----------
+
+    #[test]
+    fn window_has_submission_at_matches_when_in_same_window() {
+        // Last submit at slot 100 (window 0 with interval=300s) and a
+        // reference time also in window 0 → already-submitted.
+        let interval_s = 300u64;
+        let last = 100i64;
+        let now = 250i64;
+        assert!(window_has_submission_at(Some(last), interval_s, now));
+    }
+
+    #[test]
+    fn window_has_submission_at_clears_in_next_window() {
+        // Last at slot 100 (window 0), now at slot 350 (window 1).
+        // The pre-poll flow gates on `now = next_boundary`, so the
+        // returned `false` lets the operator submit in the new window.
+        let interval_s = 300u64;
+        let last = 100i64;
+        let now = 350i64;
+        assert!(!window_has_submission_at(Some(last), interval_s, now));
+    }
+
+    #[test]
+    fn window_has_submission_at_handles_missing_last_submit() {
+        // Operator never submitted → return false regardless of `now`.
+        assert!(!window_has_submission_at(None, 300, 999_999));
+        assert!(!window_has_submission_at(Some(0), 300, 999_999));
+    }
+
+    #[test]
+    fn window_has_submission_at_boundary_case_just_inside_window() {
+        // Last submit at the very last second of a window; `now` at the
+        // very first second of the same window → still match.
+        let interval_s = 300u64;
+        // Window starts at slot 600 (= 600/300=2). last at 899 (still
+        // in window 2 since 899/300=2). now=600 (start of window 2).
+        assert!(window_has_submission_at(Some(899), interval_s, 600));
     }
 }
