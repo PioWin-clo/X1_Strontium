@@ -1,4 +1,4 @@
-//! # X1 Strontium v1.2.0
+//! # X1 Strontium v1.2.1
 //!
 //! Decentralised atomic-time oracle for the X1 blockchain. The contract
 //! uses a file-based oracle keypair model: each operator runs a daemon that
@@ -34,10 +34,13 @@
 //! turns. `submit_time` updates only the caller's `last_submitted_window_id`
 //! (cheap, fixed-cost). A separate `cleanup_inactive` instruction can be
 //! called by anyone with a batch of `ValidatorRegistration` accounts in
-//! `remaining_accounts`; for each one it computes
-//! `windows_since_last_submit / windows_per_turn(n_operators)` and marks
-//! `is_active = false` if that exceeds `MAX_MISSED_TURNS`. `n_operators`
-//! and `quorum_threshold` are recomputed atomically.
+//! `remaining_accounts`; for each stale one it CLOSES the PDA — lamports
+//! return to `payer` (the cleanup-TX signer), the data is zeroed and the
+//! discriminator is overwritten with `CLOSED_ACCOUNT_DISCRIMINATOR`.
+//! Closing the PDA (rather than just flipping `is_active = false`) is what
+//! allows the same `oracle_keypair` to re-register after the contract
+//! garbage-collects the address. `n_operators` and `quorum_threshold` are
+//! recomputed atomically.
 //!
 //! At fleet size n=2 a missed-turn bound of 10 collapses into ~100 minutes
 //! of inactivity; at n=100 it spans roughly 14 hours. Threshold scales
@@ -80,7 +83,9 @@ pub const MIN_CONFIDENCE: u8 = 60;
 pub const MAX_SPREAD_MS: i64 = 50;
 
 /// An operator who misses strictly more than this many of their own
-/// rotation turns in a row gets `is_active = false` set by `cleanup_inactive`.
+/// rotation turns in a row gets their `ValidatorRegistration` PDA closed
+/// by `cleanup_inactive` (lamports return to the cleanup-TX payer; the
+/// PDA address is freed for re-registration).
 pub const MAX_MISSED_TURNS: u8 = 10;
 
 /// Bootstrap-mode threshold: the oracle reports `is_degraded = 1`
@@ -256,21 +261,35 @@ pub mod x1_strontium {
         Ok(())
     }
 
-    /// Mark stale operators as inactive. Permissionless — any caller (paying
-    /// only TX fee) supplies a batch of `ValidatorRegistration` accounts in
-    /// `remaining_accounts` (mut). For each one still flagged active, the
-    /// instruction computes `missed_own_turns` and flips `is_active = false`
-    /// if that exceeds `MAX_MISSED_TURNS`. `n_operators` and
-    /// `quorum_threshold` are decremented atomically. `last_cleanup_slot` is
-    /// stamped so daemons can throttle redundant cleanups.
+    /// Close stale registration PDAs. Permissionless — any signer can
+    /// invoke; lamports from closed PDAs flow to the `payer` signer
+    /// (effectively a small reward for paying the TX fee). For each
+    /// registration in `remaining_accounts`:
+    ///
+    /// - **Active and stale** (`missed_own_turns > MAX_MISSED_TURNS`):
+    ///   close the PDA, decrement `n_operators`.
+    /// - **Already inactive** (legacy v1.2.0 leftover where the PDA was
+    ///   flagged `is_active = false` but never closed): close the PDA,
+    ///   no `n_operators` adjustment — the count was already decremented
+    ///   at flagging time.
+    /// - **Active but recent**: skip.
+    ///
+    /// Closing (vs. just flipping a flag) is the v1.2.1 fix: the v1.2.0
+    /// path left the PDA on chain with `is_active = false`, which made
+    /// re-registering the same `oracle_keypair` impossible — Anchor's
+    /// `init` constraint rejected it with "account already in use".
+    ///
+    /// `quorum_threshold` and `last_cleanup_slot` are updated atomically.
     pub fn cleanup_inactive<'info>(
         ctx: Context<'_, '_, 'info, 'info, CleanupInactive<'info>>,
     ) -> Result<()> {
         let clock = Clock::get()?;
         let current_window_id = clock.slot / WINDOW_SLOTS;
         let state = &mut ctx.accounts.oracle_state.load_mut()?;
+        let payer_info = ctx.accounts.payer.to_account_info();
 
-        let mut removed: u16 = 0;
+        let mut closed: u16 = 0;
+        let mut removed_active: u16 = 0;
         let n_at_start = state.n_operators;
 
         for info in ctx.remaining_accounts.iter() {
@@ -281,34 +300,45 @@ pub mod x1_strontium {
             // Try to wrap as a ValidatorRegistration. If discriminator or
             // size doesn't match, skip silently — caller may have included
             // unrelated accounts in remaining_accounts.
-            let mut acct = match Account::<'info, ValidatorRegistration>::try_from(info) {
+            let acct = match Account::<'info, ValidatorRegistration>::try_from(info) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            if !acct.is_active {
-                continue;
-            }
 
-            let missed =
-                missed_own_turns(current_window_id, acct.last_submitted_window_id, n_at_start);
-            if missed > MAX_MISSED_TURNS as u64 {
-                acct.is_active = false;
-                acct.exit(&crate::ID)?;
-                removed = removed
-                    .checked_add(1)
-                    .ok_or(error!(X1StrontiumError::Overflow))?;
+            match cleanup_decision(
+                acct.is_active,
+                current_window_id,
+                acct.last_submitted_window_id,
+                n_at_start,
+            ) {
+                CleanupDecision::Skip => continue,
+                CleanupDecision::CloseLegacy => {
+                    acct.close(payer_info.clone())?;
+                    closed = closed
+                        .checked_add(1)
+                        .ok_or(error!(X1StrontiumError::Overflow))?;
+                }
+                CleanupDecision::CloseStale => {
+                    acct.close(payer_info.clone())?;
+                    closed = closed
+                        .checked_add(1)
+                        .ok_or(error!(X1StrontiumError::Overflow))?;
+                    removed_active = removed_active
+                        .checked_add(1)
+                        .ok_or(error!(X1StrontiumError::Overflow))?;
+                }
             }
         }
 
-        if removed > 0 {
-            state.n_operators = state.n_operators.saturating_sub(removed);
+        if removed_active > 0 {
+            state.n_operators = state.n_operators.saturating_sub(removed_active);
             state.quorum_threshold = required_quorum(state.n_operators);
         }
         state.last_cleanup_slot = clock.slot;
 
         msg!(
-            "Cleanup — removed={}, n_operators={}, quorum={}, last_cleanup_slot={}",
-            removed,
+            "Cleanup — closed={}, n_operators={}, quorum={}, last_cleanup_slot={}",
+            closed,
             state.n_operators,
             state.quorum_threshold,
             state.last_cleanup_slot
@@ -409,6 +439,47 @@ pub fn missed_own_turns(
     let wpt = windows_per_turn(n_operators);
     let windows_since = current_window_id.saturating_sub(last_submitted_window_id);
     windows_since / wpt
+}
+
+/// Outcome of `cleanup_inactive`'s per-registration dispatch. The split
+/// between `CloseLegacy` and `CloseStale` matters because v1.2.0's old
+/// flagging path already decremented `n_operators` when it flipped
+/// `is_active = false` — so a legacy leftover PDA is closed (rent
+/// recovered) but `n_operators` must NOT be touched again.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CleanupDecision {
+    /// Active operator, missed-turn count under the threshold — leave alone.
+    Skip,
+    /// Already-inactive PDA from a v1.2.0 cleanup run. Close to recover
+    /// rent and free the address; do not decrement `n_operators`.
+    CloseLegacy,
+    /// Active operator past the missed-turn threshold. Close and
+    /// decrement `n_operators` / recompute quorum.
+    CloseStale,
+}
+
+/// Pure dispatch for `cleanup_inactive`'s per-registration handling.
+/// Extracted so cargo test can exercise the v1.2.1 branching (legacy
+/// vs active-stale vs skip) without a Solana runtime.
+pub fn cleanup_decision(
+    is_active: bool,
+    current_window_id: u64,
+    last_submitted_window_id: u64,
+    n_operators_at_start: u16,
+) -> CleanupDecision {
+    if !is_active {
+        return CleanupDecision::CloseLegacy;
+    }
+    let missed = missed_own_turns(
+        current_window_id,
+        last_submitted_window_id,
+        n_operators_at_start,
+    );
+    if missed > MAX_MISSED_TURNS as u64 {
+        CleanupDecision::CloseStale
+    } else {
+        CleanupDecision::Skip
+    }
 }
 
 /// Has this submitter already pushed a submission into the current window?
@@ -606,9 +677,16 @@ pub struct CleanupInactive<'info> {
         bump = oracle_state.load()?.bump,
     )]
     pub oracle_state: AccountLoader<'info, OracleState>,
+
+    /// Cleanup-TX fee payer + lamport recipient for closed registration
+    /// PDAs. Permissionless — anyone may sign as their own receiver;
+    /// the rent recovered from closing dead PDAs is the reward for
+    /// paying the TX fee. Required as v1.2.1 (`cleanup_inactive` now
+    /// closes PDAs instead of flipping `is_active = false`, and
+    /// `acct.close()` needs an explicit AccountInfo destination).
+    #[account(mut)]
+    pub payer: Signer<'info>,
     // remaining_accounts: ValidatorRegistration accounts to consider (mut).
-    // Permissionless — no Signer<'info> field. The TX fee payer is implicit
-    // and not constrained.
 }
 
 #[derive(Accounts)]
@@ -947,6 +1025,113 @@ mod tests {
         let missed = missed_own_turns(current, last, 2);
         assert_eq!(missed, MAX_MISSED_TURNS as u64);
         assert!(missed <= MAX_MISSED_TURNS as u64);
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_decision (v1.2.1 close-instead-of-flag dispatch)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cleanup_decision_active_recent_skips() {
+        // Operator submitted in the most recent window — still active,
+        // missed = 0. Must not be touched.
+        let last = 1_000_000u64;
+        let current = last; // same window
+        assert_eq!(
+            cleanup_decision(true, current, last, 5),
+            CleanupDecision::Skip
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_active_at_boundary_skips() {
+        // Exactly MAX_MISSED_TURNS missed turns — boundary stays active
+        // because the contract uses strict `>` for the threshold.
+        let last = 1_000_000u64;
+        let current = last + 20; // 10 missed at n=2 == MAX_MISSED_TURNS
+        assert_eq!(
+            cleanup_decision(true, current, last, 2),
+            CleanupDecision::Skip
+        );
+    }
+
+    #[test]
+    fn cleanup_decision_active_stale_returns_close_stale() {
+        // 11 missed turns at n=2 (22 windows elapsed) → close + decrement.
+        let last = 1_000_000u64;
+        let current = last + 22;
+        assert_eq!(
+            cleanup_decision(true, current, last, 2),
+            CleanupDecision::CloseStale
+        );
+    }
+
+    /// v1.2.1 legacy path — a v1.2.0 cleanup run set is_active=false but
+    /// did not close the PDA. The new dispatch must close such PDAs
+    /// without further n_operators bookkeeping (already counted at the
+    /// original flagging time).
+    #[test]
+    fn cleanup_decision_already_inactive_returns_close_legacy() {
+        let last = 1_000_000u64;
+        let current = last + 22; // would be stale, but is_active=false short-circuits
+        assert_eq!(
+            cleanup_decision(false, current, last, 2),
+            CleanupDecision::CloseLegacy
+        );
+        // Even a "fresh-looking" inactive PDA falls into the legacy
+        // bucket — being inactive is itself the close condition.
+        assert_eq!(
+            cleanup_decision(false, last, last, 2),
+            CleanupDecision::CloseLegacy
+        );
+    }
+
+    /// Bookkeeping invariant: when a close decision lands as
+    /// `CloseStale`, the n_operators decrement must happen exactly
+    /// once. This test simulates the contract's loop on a small batch
+    /// and verifies the resulting state matches the dispatch.
+    #[test]
+    fn cleanup_decision_batch_matches_close_and_removed_counts() {
+        // Mock fleet of 3 active operators (windows_per_turn(3) = 3,
+        // so >10 missed turns needs ≥33 windows since last submit).
+        // - one fresh (skip)
+        // - one active+stale (close + decrement)
+        // - one already-inactive legacy leftover (close, no decrement)
+        let n_at_start: u16 = 3;
+        let current = 1_000_033u64;
+        let cases: Vec<(bool, u64, CleanupDecision)> = vec![
+            (true, current, CleanupDecision::Skip),
+            (true, current - 33, CleanupDecision::CloseStale),
+            (false, current - 33, CleanupDecision::CloseLegacy),
+        ];
+
+        let mut closed = 0u16;
+        let mut removed_active = 0u16;
+        for (is_active, last, expected) in &cases {
+            let d = cleanup_decision(*is_active, current, *last, n_at_start);
+            assert_eq!(&d, expected);
+            match d {
+                CleanupDecision::Skip => {}
+                CleanupDecision::CloseLegacy => closed += 1,
+                CleanupDecision::CloseStale => {
+                    closed += 1;
+                    removed_active += 1;
+                }
+            }
+        }
+        assert_eq!(closed, 2, "two PDAs should close (one stale, one legacy)");
+        assert_eq!(
+            removed_active, 1,
+            "only the active+stale path decrements n_operators"
+        );
+
+        // After applying: n_operators = 3 - 1 = 2. quorum recomputes.
+        let mut state = zeroed_state();
+        state.n_operators = n_at_start;
+        state.n_operators = state.n_operators.saturating_sub(removed_active);
+        state.quorum_threshold = required_quorum(state.n_operators);
+        assert_eq!(state.n_operators, 2);
+        assert_eq!(state.quorum_threshold, 1);
     }
 
     #[test]

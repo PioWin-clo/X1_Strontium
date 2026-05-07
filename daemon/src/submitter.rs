@@ -1008,12 +1008,16 @@ pub fn build_register_transaction(
 
 /// Build and sign a `cleanup_inactive` Anchor transaction with a batch of
 /// candidate `ValidatorRegistration` PDAs in `remaining_accounts` (all
-/// passed as writable). The fee payer is also the lone signer; the
-/// instruction itself takes no signer-derived state, so any caller can
-/// invoke it. The contract iterates the batch, marks any operator that
-/// has missed strictly more than `MAX_MISSED_TURNS` of their own rotation
-/// turns as `is_active = false`, and recomputes `n_operators` /
-/// `quorum_threshold` / `last_cleanup_slot` accordingly.
+/// passed as writable). The fee payer is also the lone signer; lamports
+/// from any closed PDA flow back to this same key (the contract uses
+/// `payer` both as `Signer<'info>` and as the destination of
+/// `acct.close()`). The contract iterates the batch and CLOSES any
+/// stale `ValidatorRegistration` PDA (lamports → payer, data zeroed,
+/// discriminator overwritten with `CLOSED_ACCOUNT_DISCRIMINATOR`),
+/// recomputing `n_operators` / `quorum_threshold` / `last_cleanup_slot`.
+/// v1.2.1 fix: prior versions only flipped `is_active = false`, which
+/// left the PDA on chain and prevented re-registration with the same
+/// `oracle_keypair`.
 pub fn build_cleanup_inactive_transaction(
     fee_payer: &SigningKey,
     program_id: &[u8; 32],
@@ -1058,10 +1062,13 @@ pub fn build_cleanup_inactive_transaction(
             .expect("ordered_keys must contain all referenced accounts") as u8
     };
 
-    // CleanupInactive Anchor derive order: oracle_state + remaining_accounts
+    // CleanupInactive Anchor derive order (v1.2.1):
+    //   [0] oracle_state    (writable, PDA)
+    //   [1] payer           (writable, signer — receives closed-PDA lamports)
+    //   [2..] remaining_accounts (writable, registration PDAs)
     let discriminator = anchor_discriminator("cleanup_inactive");
     let ix_data: Vec<u8> = discriminator.to_vec();
-    let mut ix_accounts: Vec<u8> = vec![idx(oracle_pda)];
+    let mut ix_accounts: Vec<u8> = vec![idx(oracle_pda), idx(&payer_pubkey)];
     for r in &regs {
         ix_accounts.push(idx(r));
     }
@@ -1763,5 +1770,185 @@ mod tests {
         assert_eq!(tried, vec!["https://warm"]);
         // Cold URL still cooled — bypass did NOT trigger.
         assert!(rpc.cooldown_until[0] > 0);
+    }
+
+    // ---------- build_cleanup_inactive_transaction (BUG 3 v1.2.1) ----------
+
+    /// Decode just enough of a built TX to inspect its account layout
+    /// and instruction-account index list. Returns
+    /// (ordered_keys, ix_program_id_index, ix_accounts).
+    fn parse_cleanup_tx_layout(tx: &[u8]) -> (Vec<[u8; 32]>, u8, Vec<u8>) {
+        // [compact(num_sigs)] [sigs...] [msg]
+        // For 1 signature: compact(1) = 0x01.
+        assert_eq!(tx[0], 1, "expected exactly 1 signature");
+        let mut p = 1 + 64;
+
+        // Header.
+        let _num_required_signatures = tx[p];
+        p += 1;
+        let _num_readonly_signed = tx[p];
+        p += 1;
+        let _num_readonly_unsigned = tx[p];
+        p += 1;
+
+        // compact(account_keys.len()).
+        let n_keys = tx[p] as usize; // small fleet → fits in 1 byte
+        assert!(
+            n_keys < 0x80,
+            "test only supports 1-byte compact for n_keys"
+        );
+        p += 1;
+
+        let mut ordered_keys: Vec<[u8; 32]> = Vec::with_capacity(n_keys);
+        for _ in 0..n_keys {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&tx[p..p + 32]);
+            ordered_keys.push(k);
+            p += 32;
+        }
+
+        // Skip blockhash.
+        p += 32;
+
+        // compact(num_instructions = 1).
+        assert_eq!(tx[p], 1, "expected exactly 1 instruction");
+        p += 1;
+        let ix_program_id_index = tx[p];
+        p += 1;
+        // compact(ix_accounts.len()).
+        let n_ix_accounts = tx[p] as usize;
+        assert!(
+            n_ix_accounts < 0x80,
+            "test only supports 1-byte compact for n_ix_accounts"
+        );
+        p += 1;
+        let ix_accounts = tx[p..p + n_ix_accounts].to_vec();
+
+        (ordered_keys, ix_program_id_index, ix_accounts)
+    }
+
+    fn fixed_signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    #[test]
+    fn cleanup_tx_includes_payer_in_ix_accounts() {
+        let payer = fixed_signing_key(0xA1);
+        let payer_pubkey = payer.verifying_key().to_bytes();
+        let program_id = [0xC0u8; 32];
+        let oracle_pda = [0x05u8; 32];
+        let blockhash = [0xBBu8; 32];
+        let regs = vec![[0x10u8; 32], [0x20u8; 32]];
+
+        let tx =
+            build_cleanup_inactive_transaction(&payer, &program_id, &oracle_pda, &regs, &blockhash);
+        let (ordered_keys, ix_program_id_index, ix_accounts) = parse_cleanup_tx_layout(&tx);
+
+        // Layout: [payer (writable signed), oracle_pda, regs..., program_id (readonly)]
+        assert_eq!(ordered_keys[0], payer_pubkey);
+        assert_eq!(ordered_keys[1], oracle_pda);
+        assert!(ordered_keys.contains(&regs[0]));
+        assert!(ordered_keys.contains(&regs[1]));
+        assert_eq!(ordered_keys[ix_program_id_index as usize], program_id);
+
+        // BUG 3 fix: ix_accounts must now be [oracle_pda, payer, ...regs].
+        // The prior v1.2.0 layout omitted payer, which makes the new
+        // contract reject the TX (CleanupInactive expects a Signer field).
+        assert_eq!(ix_accounts.len(), 2 + regs.len());
+        let oracle_idx = ordered_keys.iter().position(|k| k == &oracle_pda).unwrap() as u8;
+        let payer_idx = ordered_keys
+            .iter()
+            .position(|k| k == &payer_pubkey)
+            .unwrap() as u8;
+        assert_eq!(
+            ix_accounts[0], oracle_idx,
+            "ix_accounts[0] must point at oracle_state"
+        );
+        assert_eq!(
+            ix_accounts[1], payer_idx,
+            "ix_accounts[1] must point at payer (v1.2.1 layout)"
+        );
+        for reg in &regs {
+            let reg_idx = ordered_keys.iter().position(|k| k == reg).unwrap() as u8;
+            assert!(ix_accounts[2..].contains(&reg_idx));
+        }
+    }
+
+    #[test]
+    fn cleanup_tx_payer_index_is_writable_signer_slot() {
+        // Header invariant: the payer is a writable signer (slot 0) — so
+        // the program may (and does) debit lamports from it for TX fees
+        // and ALSO credit the lamports recovered from `acct.close()`.
+        let payer = fixed_signing_key(0xA2);
+        let tx = build_cleanup_inactive_transaction(
+            &payer,
+            &[0xC0u8; 32],
+            &[0x05u8; 32],
+            &[[0x10u8; 32]],
+            &[0xBBu8; 32],
+        );
+
+        // tx[0..1]: compact(num_sigs)=1; tx[1..65]: signature; tx[65..]: msg
+        // Header: [num_required_sigs, num_readonly_signed, num_readonly_unsigned]
+        let header_offset = 1 + 64;
+        assert_eq!(tx[header_offset], 1, "exactly 1 signer (payer)");
+        assert_eq!(tx[header_offset + 1], 0, "no readonly signers");
+        // 1 readonly_unsigned = program_id; payer is writable_signed at idx 0.
+        assert_eq!(tx[header_offset + 2], 1);
+    }
+
+    #[test]
+    fn cleanup_tx_dedups_payer_against_regs() {
+        // Defensive: even if the caller (somehow) supplies their own
+        // payer pubkey as a registration PDA, the TX builder must dedupe
+        // — Solana's runtime rejects messages with duplicate keys
+        // (AccountLoadedTwice).
+        let payer = fixed_signing_key(0xA3);
+        let payer_pubkey = payer.verifying_key().to_bytes();
+        let program_id = [0xC0u8; 32];
+        let oracle_pda = [0x05u8; 32];
+        let blockhash = [0xBBu8; 32];
+        // Three "registrations", but two of them collide with the payer
+        // and oracle_pda. After dedup only the genuine one remains.
+        let regs = vec![payer_pubkey, oracle_pda, [0x30u8; 32]];
+
+        let tx =
+            build_cleanup_inactive_transaction(&payer, &program_id, &oracle_pda, &regs, &blockhash);
+        let (ordered_keys, _ix_pid, ix_accounts) = parse_cleanup_tx_layout(&tx);
+
+        // No key appears twice.
+        for i in 0..ordered_keys.len() {
+            for j in (i + 1)..ordered_keys.len() {
+                assert_ne!(
+                    ordered_keys[i], ordered_keys[j],
+                    "ordered_keys must be deduplicated"
+                );
+            }
+        }
+        // ix_accounts: [oracle_pda, payer, only_genuine_reg] = 3 entries.
+        assert_eq!(ix_accounts.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_tx_with_no_regs_still_lists_oracle_and_payer() {
+        // Edge case: empty registration_pdas. Builder must still produce
+        // a valid TX whose ix_accounts is exactly [oracle_pda, payer].
+        // This shape is what the contract's `cleanup_inactive` sees when
+        // remaining_accounts is empty (a no-op stale-check that updates
+        // `last_cleanup_slot` but closes nothing).
+        let payer = fixed_signing_key(0xA4);
+        let tx = build_cleanup_inactive_transaction(
+            &payer,
+            &[0xC0u8; 32],
+            &[0x05u8; 32],
+            &[],
+            &[0xBBu8; 32],
+        );
+        let (_ordered_keys, _ix_pid, ix_accounts) = parse_cleanup_tx_layout(&tx);
+        assert_eq!(
+            ix_accounts.len(),
+            2,
+            "ix_accounts must contain [oracle_pda, payer] only"
+        );
     }
 }
