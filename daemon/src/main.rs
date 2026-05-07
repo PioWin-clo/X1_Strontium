@@ -525,9 +525,13 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             if current_slot > 0
                 && current_slot.saturating_sub(header.last_cleanup_slot) > CLEANUP_STALE_SLOTS
             {
-                if let Err(e) =
-                    try_cleanup_inactive(&mut rpc, &oracle_keypair, &program_id, &oracle_pda)
-                {
+                if let Err(e) = try_cleanup_inactive(
+                    &mut rpc,
+                    &oracle_keypair,
+                    &program_id,
+                    &oracle_pda,
+                    current_slot,
+                ) {
                     eprintln!("[cleanup] preflight skipped: {e}");
                 }
             }
@@ -1870,21 +1874,67 @@ fn compute_self_stake_off_chain(
     Ok(total)
 }
 
+/// Replicated from `programs/x1-strontium/src/lib.rs` so the daemon can
+/// mirror the contract's stale-operator math when deciding whether to
+/// fire `cleanup_inactive`. Bumped together with the contract literal
+/// — there is no enforcement linking the two values, so a contract
+/// change without a daemon change here would leak no-op TXs again.
+const CLEANUP_MAX_MISSED_TURNS: u64 = 10;
+const CLEANUP_WINDOW_SLOTS: u64 = 150;
+
+/// Daemon-side mirror of `programs/x1-strontium/src/lib.rs::windows_per_turn`.
+/// Used only by the `try_cleanup_inactive` pre-flight stale-check.
+fn windows_per_turn_daemon(n_operators: u16) -> u64 {
+    use crate::rotation::MAX_SUBMISSIONS;
+    if n_operators == 0 {
+        return 1;
+    }
+    if (n_operators as usize) <= MAX_SUBMISSIONS {
+        return n_operators as u64;
+    }
+    (n_operators as u64).div_ceil(MAX_SUBMISSIONS as u64)
+}
+
 /// Cleanup pre-flight: fetch all active registrations and fire one
-/// `cleanup_inactive` TX that asks the contract to evaluate every one of
-/// them. The contract iterates the batch, marks any operator past the
-/// 10-missed-turns threshold as `is_active = false`, and stamps
+/// `cleanup_inactive` TX that asks the contract to evaluate every one
+/// of them. The contract iterates the batch, marks any operator past
+/// the 10-missed-turns threshold as `is_active = false`, and stamps
 /// `last_cleanup_slot` so other daemons in the same cycle skip this work.
+///
+/// v1.2.0 hotfix: pre-flight first checks whether ANY registration is
+/// stale; if not, no TX is sent (saves ~0.004 XNT per daemon per cycle
+/// on a healthy fleet, which is the common case).
 fn try_cleanup_inactive(
     rpc: &mut RpcClient,
     fee_payer: &SigningKey,
     program_id: &[u8; 32],
     oracle_pda: &[u8; 32],
+    current_slot: u64,
 ) -> Result<(), String> {
     let regs: Vec<RegistrationEntry> = rpc.fetch_active_registrations(program_id)?;
     if regs.is_empty() {
         return Err("no active registrations to evaluate".to_string());
     }
+
+    // Stale-check: mirror the contract's `missed_own_turns > MAX_MISSED_TURNS`
+    // semantics. Skip the TX when no registration would be touched.
+    let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
+    let n = regs.len().min(u16::MAX as usize) as u16;
+    let wpt = windows_per_turn_daemon(n).max(1);
+    let any_stale = regs.iter().any(|r| {
+        let windows_since = current_window_id.saturating_sub(r.last_submitted_window_id);
+        windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+    });
+    if !any_stale {
+        if std::env::var("X1SR_DEBUG").is_ok() {
+            eprintln!(
+                "[cleanup] no stale operators among {} active — skipping TX",
+                regs.len()
+            );
+        }
+        return Ok(());
+    }
+
     let blockhash = rpc.get_recent_blockhash()?;
     let pdas: Vec<[u8; 32]> = regs.iter().map(|r| r.pda).collect();
     let tx =
@@ -1994,6 +2044,64 @@ mod tests {
     fn next_window_boundary_secs_clamps_zero_interval_to_one() {
         // Defensive: interval = 0 must not panic. Treated as 1s.
         assert_eq!(next_window_boundary_secs(100, 0), 101);
+    }
+
+    // ---------- cleanup pre-flight stale check (v1.2.0 hotfix) ----------
+
+    #[test]
+    fn windows_per_turn_daemon_mirrors_contract_math() {
+        // Same regimes as `programs/x1-strontium/src/lib.rs::windows_per_turn`.
+        // n ≤ 6: primary slot rotates every n windows.
+        assert_eq!(windows_per_turn_daemon(0), 1);
+        assert_eq!(windows_per_turn_daemon(1), 1);
+        assert_eq!(windows_per_turn_daemon(2), 2);
+        assert_eq!(windows_per_turn_daemon(6), 6);
+        // n > 6: window-slot model, ⌈n / 6⌉.
+        assert_eq!(windows_per_turn_daemon(7), 2);
+        assert_eq!(windows_per_turn_daemon(10), 2);
+        assert_eq!(windows_per_turn_daemon(13), 3);
+        assert_eq!(windows_per_turn_daemon(100), 17);
+    }
+
+    #[test]
+    fn cleanup_stale_check_skips_when_fleet_healthy() {
+        // n=2, both registrations submitted in the current window
+        // (last_submitted_window_id = current_window_id) → 0 missed
+        // turns each → no stale → daemon must NOT fire the TX.
+        let interval_s = 300u64;
+        let current_slot = 1_000_000u64;
+        let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
+        let n = 2u16;
+        let wpt = windows_per_turn_daemon(n).max(1);
+
+        // Two registrations both fresh.
+        let last_submits = [current_window_id, current_window_id];
+        let any_stale = last_submits.iter().any(|&last| {
+            let windows_since = current_window_id.saturating_sub(last);
+            windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+        });
+        assert!(!any_stale, "healthy fleet must not trigger cleanup");
+        // Sanity: interval_s isn't used by the math here — the
+        // window math derives the window id directly from slot count.
+        let _ = interval_s;
+    }
+
+    #[test]
+    fn cleanup_stale_check_fires_when_one_operator_stale() {
+        // n=2, operator A submitted recently, operator B has been
+        // silent for >10 of its own turns (n=2 → wpt=2 → 22 windows
+        // back is 11 missed turns > MAX_MISSED_TURNS=10).
+        let current_slot = 1_000_000u64;
+        let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
+        let n = 2u16;
+        let wpt = windows_per_turn_daemon(n).max(1);
+
+        let last_submits = [current_window_id, current_window_id - 22];
+        let any_stale = last_submits.iter().any(|&last| {
+            let windows_since = current_window_id.saturating_sub(last);
+            windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+        });
+        assert!(any_stale, "stale operator B must trigger cleanup");
     }
 
     // ---------- sysdrift gate ----------
