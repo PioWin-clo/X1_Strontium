@@ -1,7 +1,7 @@
-//! # X1 Strontium v1.1
+//! # X1 Strontium v1.2.0
 //!
-//! Decentralised atomic-time oracle for the X1 blockchain. v1.1 returns to
-//! the file-based oracle keypair model: each operator runs a daemon that
+//! Decentralised atomic-time oracle for the X1 blockchain. The contract
+//! uses a file-based oracle keypair model: each operator runs a daemon that
 //! generates a fresh `oracle.json` keypair locally, receives a one-time
 //! XNT transfer from the operator's hardware wallet, then auto-registers
 //! and submits time for the rest of its life. No Ledger USB in daily flow.
@@ -20,12 +20,13 @@
 //!
 //! ## Anti-farm gates
 //!
-//! Self-stake (≥ 128 XNT, withdrawer == vote.authorized_withdrawer) and
-//! validator age (≥ 64 epochs of vote credits) are enforced **off-chain**
-//! by the daemon. The daemon refuses to send `register_submitter` if
-//! either gate fails, and silences itself (stops submitting) if self-stake
-//! drops at the 24h recheck. The contract holds no parsers — anyone can
-//! audit the gates by reading the open-source daemon code.
+//! Self-stake withdrawer-match (a stake account exists whose withdraw
+//! authority equals `vote.authorized_withdrawer`) and validator age
+//! (≥ 64 epochs of vote credits) are enforced **off-chain** by the
+//! daemon. The daemon refuses to send `register_submitter` if either
+//! gate fails, and silences itself (stops submitting) if no qualifying
+//! stake remains at the 24h recheck. The contract holds no parsers —
+//! anyone can audit the gates by reading the open-source daemon code.
 //!
 //! ## Auto-cleanup
 //!
@@ -96,9 +97,9 @@ pub const MIN_QUORUM_ABSOLUTE: u16 = 3;
 pub const ORACLE_STATE_SEED: &[u8] = b"X1";
 pub const ORACLE_STATE_SEED_2: &[u8] = b"Strontium";
 pub const ORACLE_STATE_SEED_3: &[u8] = b"v1";
-/// Fourth seed segment, new in v1.1. The v1.0 OracleState lived at the
-/// 3-segment derivation and is left orphaned on chain (~0.07 XNT rent
-/// locked forever — accepted as the cost of the v1.0 mistake).
+/// Fourth seed segment. The v1.0 OracleState lived at the 3-segment
+/// derivation and is left orphaned on chain (~0.07 XNT rent locked
+/// forever — accepted as the cost of the v1.0 mistake).
 pub const ORACLE_STATE_SEED_4: &[u8] = b"oracle";
 
 /// Seed for `ValidatorRegistration` PDAs — `[REG_SEED, oracle_keypair]`.
@@ -143,8 +144,9 @@ pub mod x1_strontium {
     /// Two signers are required: `oracle_keypair` (the new server-local
     /// key, which also pays rent) and `vote_keypair` (the validator's vote
     /// account keypair). The contract performs no on-chain validation of
-    /// the vote account — anti-farm gates (64+ epochs, ≥ 128 XNT
-    /// self-stake) are enforced by the daemon before this TX is built.
+    /// the vote account — anti-farm gates (64+ epochs + a qualifying
+    /// stake whose withdraw authority equals vote.authorized_withdrawer)
+    /// are enforced by the daemon before this TX is built.
     pub fn register_submitter(ctx: Context<RegisterSubmitter>) -> Result<()> {
         let clock = Clock::get()?;
         let state = &mut ctx.accounts.oracle_state.load_mut()?;
@@ -1088,7 +1090,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // v1.1.1 patch regression tests
+    // patch regression tests
     // -----------------------------------------------------------------------
 
     #[test]

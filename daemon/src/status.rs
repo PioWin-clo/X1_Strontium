@@ -120,6 +120,19 @@ pub struct DaemonStatus {
     pub ntp_sources: Vec<NtpSourceStatus>,
     pub rotation_window_id: Option<u64>,
     pub rotation_is_my_turn: Option<bool>,
+    /// Active fleet size at last refresh — used by `x1sr status` runway
+    /// display and sanity output. None when daemon hasn't fetched yet
+    /// (status command then falls back to a solo estimate).
+    pub n_operators: Option<u16>,
+    /// `precise_time_ms - chain_time_ms` from the last successful
+    /// submission's memo (positive: our time ahead of chain). None when
+    /// the chain RPC was unavailable at submit time, or no submission
+    /// has been made yet.
+    pub last_drift_ms: Option<i64>,
+    /// `precise_time_ms - sys_at_consensus_ms` from the last successful
+    /// submission's memo (positive: our time ahead of system clock).
+    /// None until the first successful submission.
+    pub last_sysdrift_ms: Option<i64>,
 }
 
 impl DaemonStatus {
@@ -146,6 +159,9 @@ impl DaemonStatus {
             ntp_sources: Vec::new(),
             rotation_window_id: None,
             rotation_is_my_turn: None,
+            n_operators: None,
+            last_drift_ms: None,
+            last_sysdrift_ms: None,
         }
     }
 
@@ -225,21 +241,35 @@ impl DaemonStatus {
         } else {
             row("Balance", &format!("{:.3} XNT", self.balance_xnt));
         }
+        // Runway is computed by the daemon main loop with the active
+        // fleet size n already factored in (~1/n of the windows fall to
+        // each operator). Display the stored value rather than recompute
+        // a solo estimate that would silently understate the runway for
+        // any n > 1. If the daemon hasn't fetched the fleet yet, tag the
+        // line as a solo estimate.
         let cost_per_tx: f64 = 0.004;
+        let n_display = self.n_operators.unwrap_or(1);
         let tx_per_day: f64 = if self.interval_s > 0 {
             86_400.0 / self.interval_s as f64
         } else {
             0.0
         };
-        let daily_cost = cost_per_tx * tx_per_day;
-        let runway_days = if daily_cost > 0.0 {
-            self.balance_xnt / daily_cost
+        let my_share = if n_display > 0 {
+            tx_per_day / n_display as f64
         } else {
-            0.0
+            tx_per_day
+        };
+        let solo_tag = if self.n_operators.is_none() {
+            "  (solo estimate)"
+        } else {
+            ""
         };
         row(
             "Runway",
-            &format!("~{runway_days:.0} days  (@ {cost_per_tx:.3} XNT x {tx_per_day:.0} TX/day)"),
+            &format!(
+                "~{:.0} days  (@ {cost_per_tx:.3} XNT × {my_share:.0} TX/day, n={n_display}){solo_tag}",
+                self.days_remaining
+            ),
         );
 
         // ── Last Submission ──
@@ -308,6 +338,20 @@ impl DaemonStatus {
             }
             None => row("Confidence", "—"),
         }
+        row(
+            "Chain drift",
+            &format!(
+                "{}    (our time vs Clock::unix_timestamp)",
+                format_drift(self.last_drift_ms)
+            ),
+        );
+        row(
+            "Sys drift",
+            &format!(
+                "{}    (our time vs system clock)",
+                format_drift(self.last_sysdrift_ms)
+            ),
+        );
         let active: Vec<&NtpSourceStatus> = self.ntp_sources.iter().filter(|s| s.active).collect();
         let active_count = active.len();
         row("Sources active", &format!("{active_count} / 40+"));
@@ -457,6 +501,31 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let mon = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mon <= 2 { y + 1 } else { y };
     (y, mon as u32, d as u32)
+}
+
+/// Render a signed millisecond drift in the form "+2 s" / "-150 ms",
+/// switching to seconds when the magnitude is at least 1000 ms. None
+/// renders as "(no submission yet)" — the status command's stable
+/// placeholder for fields that depend on the last successful submit.
+fn format_drift(ms: Option<i64>) -> String {
+    match ms {
+        None => "(no submission yet)".to_string(),
+        Some(m) if m.abs() >= 1000 => {
+            let secs = m / 1000;
+            if secs >= 0 {
+                format!("+{secs} s")
+            } else {
+                format!("{secs} s")
+            }
+        }
+        Some(m) => {
+            if m >= 0 {
+                format!("+{m} ms")
+            } else {
+                format!("{m} ms")
+            }
+        }
+    }
 }
 
 /// Human-readable "X min ago" / "X hours ago" from a unix timestamp.

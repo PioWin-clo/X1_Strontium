@@ -14,7 +14,7 @@ X1 mainnet. Any X1 program can then call `read_time` over CPI to get a
 trustworthy clock — without depending on the unreliable on-chain
 `Clock::unix_timestamp`.
 
-**v1.1.1** is an in-place upgrade that replaces the operator-onboarding
+**v1.2.0** is an in-place upgrade that replaces the operator-onboarding
 flow with a simpler file-based model. The Program ID is preserved
 (deployed via `solana program deploy --program-id <existing>`) but the
 OracleState PDA gains a fourth seed segment so the v1.0 PDA at
@@ -45,7 +45,7 @@ the missing certified time reference.
 
 ---
 
-## Quick facts (mainnet v1.1.1)
+## Quick facts (mainnet v1.2.0)
 
 | Field                  | Value                                                  |
 |------------------------|--------------------------------------------------------|
@@ -58,7 +58,7 @@ the missing certified time reference.
 | Aggregation window     | 150 slots (~60 s)                                      |
 | Ring buffer depth      | 288 entries (24 h of history at 5-minute cadence)      |
 | Quorum                 | 10 % of registered operators, min 1, max 6             |
-| Minimum self-stake     | 128 XNT per operator (off-chain gate)                  |
+| Minimum self-stake     | withdrawer-match: stake withdraw authority must equal vote account authorized_withdrawer (off-chain gate) |
 | Minimum validator age  | 64 epochs of voting history (off-chain gate)           |
 | Auto-cleanup threshold | 10 of an operator's own rotation turns missed in a row |
 | On-chain account size  | 9744 B (488 B headroom under X1's 10 240 B CPI cap)    |
@@ -67,7 +67,7 @@ the missing certified time reference.
 Retired (closed on chain) v0.5 Program ID for reference only:
 `2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`.
 
-**Bootstrap mode (v1.1.1+).** Strontium reports `is_degraded = 1`
+**Bootstrap mode.** Strontium reports `is_degraded = 1`
 regardless of per-window quorum and confidence whenever the active
 operator fleet is below `MIN_QUORUM_ABSOLUTE = 3`. dApps should treat
 `is_degraded = 1` as a signal to fall back to alternate time sources
@@ -116,11 +116,11 @@ X1 Strontium uses a file-based oracle keypair model with a one-time
 hardware-wallet bootstrap. Joining the operator set requires:
 
 1. **An active X1 validator** with at least 64 epochs of voting history
-   (~2 months of activity) and self-stake ≥ 128 XNT, where the stake's
-   withdraw authority equals your validator's vote account
-   `authorized_withdrawer`. These are anti-farm gates verified
-   off-chain by the daemon at register time and on every 24-hour
-   refresh.
+   (~2 months of activity) and self-stake whose withdraw authority
+   equals your validator's vote account `authorized_withdrawer`
+   (withdrawer-match gate — any amount qualifies). These are anti-farm
+   gates verified off-chain by the daemon at register time and on every
+   24-hour refresh.
 
 2. **A one-time XNT transfer** from a hardware wallet (Ledger, Trezor,
    or any other) holding the validator's withdraw authority, to the
@@ -240,9 +240,9 @@ acceptable results.
 
 - **Off-chain anti-farm enforcement** — the daemon refuses to register
   or submit if the validator has fewer than 64 epochs of voting history
-  or qualifying self-stake below 128 XNT. The contract holds no
-  parsers; the gates live in the open-source daemon code that anyone
-  can audit.
+  or no self-stake with matching withdraw authority (withdrawer-match
+  gate). The contract holds no parsers; the gates live in the
+  open-source daemon code that anyone can audit.
 
 - **Auto-cleanup of inactive operators** — the contract removes
   operators who miss 10 consecutive of their own rotation turns. The
@@ -260,14 +260,10 @@ acceptable results.
 
 ## Roadmap
 
-- **v1.1** (this release) — file-based oracle keypair model, 2-signer
-  `register_submitter`, off-chain anti-farm gates, permissionless
-  `cleanup_inactive`, in-place program upgrade.
-
-- **v1.2** — `read_time_smoothed(windows)` CPI helper that reads N
-  recent ring entries, drops outliers, and returns the median. Useful
-  for consumers that want low-jitter monotone output over strict
-  most-recent-sample semantics.
+- **v1.2.0** (this release) — runway calculation corrected for fleet
+  size n, install fix (unit file always written), silent RPC fallback,
+  chain drift + sysdrift in status output, pre-computation NTP polling
+  (sub-200ms TX timing), withdrawer-match stake gate.
 
 - **v1.3** — true NTS-KE authentication on the NTS-capable endpoints.
   Today the daemon polls those servers via plain NTP; the tier label

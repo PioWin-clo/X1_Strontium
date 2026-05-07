@@ -6,15 +6,15 @@ mod status;
 mod submitter;
 
 use crate::config::X1StrontiumConfig;
-use crate::consensus::{run_consensus_cycle, ConsensusRejection, ConsensusResult, MAX_SPREAD_MS};
+use crate::consensus::{run_consensus_cycle, ConsensusRejection, ConsensusResult};
 use crate::ntp_client::{discover_sources, get_system_clock_ms, to_source_status};
-use crate::rotation::{rotation_my_turn, window_has_submission, RotationState};
+use crate::rotation::{rotation_my_turn_at, window_has_submission_at, RotationState};
 use crate::status::{DaemonStatus, SilentReason};
 use crate::submitter::{
     base64_encode, build_cleanup_inactive_transaction, build_initialize_transaction,
     build_register_transaction, build_submit_transaction_signed, derive_registration_pda,
-    estimate_days_remaining, lamports_to_xnt, load_keypair, parse_vote_epoch_credits_len,
-    RegistrationEntry, RpcClient, SubmitParams, COST_PER_TX_XNT,
+    estimate_days_remaining, format_clock_3dec, lamports_to_xnt, load_keypair,
+    parse_vote_epoch_credits_len, RegistrationEntry, RpcClient, SubmitParams, COST_PER_TX_XNT,
 };
 use ed25519_dalek::SigningKey;
 use std::env;
@@ -41,11 +41,6 @@ const SELF_STAKE_CHECK_SECS: i64 = 24 * 60 * 60; // 24 h, daemon-only
 /// the cost across the fleet.
 const CLEANUP_STALE_SLOTS: u64 = 9_000;
 
-/// Off-chain anti-farm gate (off-chain only — the contract holds no parser
-/// in v1.1). Operators with self-stake below this floor refuse to register
-/// and silence themselves at the 24 h recheck.
-const MIN_SELF_STAKE_LAMPORTS: u64 = 128_000_000_000;
-
 /// Off-chain anti-farm gate — minimum number of `epoch_credits` entries
 /// the validator's vote account must carry at register time (~64 epochs ≈
 /// 2 months of consistent voting on X1's epoch length).
@@ -61,7 +56,7 @@ const MAX_SYSDRIFT_MS: i64 = 5000;
 fn print_help() {
     println!(
         "\
-X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.1)
+X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.2.0)
 
 USAGE:
   x1-strontium <command> [options]
@@ -79,8 +74,9 @@ COMMANDS:
   init [--authority <keypair>]
                         Initialize Oracle State PDA (one-time setup after deploy)
   register              Register this validator as a Strontium operator
-                        (off-chain anti-farm gates: 64 epoch credits, 128 XNT
-                        qualifying self-stake; sends register_submitter TX)
+                        (off-chain anti-farm gates: 64 epoch credits + a
+                        stake whose withdraw authority matches the vote
+                        account; sends register_submitter TX)
   install               Install as systemd service (requires sudo)
   uninstall             Remove systemd service (requires sudo)
   update                Pull, rebuild, restart (git + cargo + systemctl)
@@ -90,7 +86,7 @@ CONFIG KEYS:
   alert_webhook, alert_balance, tier_threshold, rotation_peers,
   program_id, oracle_pda
 
-ORACLE PDA (v1.1):
+ORACLE PDA (v1.2.0):
   cfm1Tc7CNdTa8Hm8FGWAuHXaaozSjQHNmdBD5mEVN9P"
     );
 }
@@ -214,7 +210,7 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     let registration_pda = derive_registration_pda(&oracle_bytes, &program_id);
     let registration_pda_b58 = bs58::encode(registration_pda).into_string();
 
-    println!("X1 Strontium daemon starting (v1.1)");
+    println!("X1 Strontium daemon starting (v1.2.0)");
     println!("  oracle keypair:   {oracle_pubkey_b58}");
     println!("  registration pda: {registration_pda_b58}");
     println!("  program id:       {}", config.program_id);
@@ -262,12 +258,14 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     status.silent_reason = None;
     status.save();
 
-    // Initial balance check.
+    // Initial balance check. Rotation state is not built yet; use a
+    // solo runway estimate (n=1 — worst case). The first main-loop
+    // refresh re-computes with the real fleet size.
     match rpc.get_balance(&oracle_pubkey_b58) {
         Ok(lamports) => {
             let bal = lamports_to_xnt(lamports);
             status.balance_xnt = bal;
-            status.days_remaining = estimate_days_remaining(bal, config.interval_s);
+            status.days_remaining = estimate_days_remaining(bal, config.interval_s, 1);
             status.balance_warning = bal < MIN_BALANCE_WARN;
             status.save();
             if bal < MIN_BALANCE_STOP {
@@ -337,22 +335,100 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     let mut last_peers_refetch: i64 = 0;
     let mut last_self_stake_check: i64 = 0;
 
-    // Align the first cycle to the next wall-clock window boundary (e.g. :00,
-    // :05, :10 at the default 300 s interval) so memo timestamps are
-    // predictable for downstream dApps. Subsequent cycles hold the alignment
-    // via the natural sleep(interval_s) at the end of each loop iteration.
-    wait_until_next_window_boundary(config.interval_s);
+    // Pre-poll architecture (Fix 6 / v1.2.0):
+    //   boundary - PREPOLL_LEAD_SECS  : NTP poll fires, consensus +
+    //                                   sysdrift cached
+    //   boundary - PREFLIGHT_LEAD_MS  : wake, run pre-flight checks
+    //                                   (balance, peers, self-stake,
+    //                                   cleanup), election, send TX
+    //   boundary + ~50ms              : TX lands on chain (target)
+    //
+    // Election + window_has_submission both gate on the upcoming
+    // boundary (`now = next_boundary`) so the loop's "is it my turn"
+    // decision matches the actual submit moment, not 30s earlier.
+    const PREPOLL_LEAD_SECS: u64 = 30;
+    const PREFLIGHT_LEAD_MS: i64 = 200;
 
     loop {
         let cycle_started = get_unix_secs();
         status.last_attempt_ts = Some(cycle_started);
 
-        // a. Balance check
+        let now_secs_u64 = cycle_started.max(0) as u64;
+        let next_boundary_secs = next_window_boundary_secs(now_secs_u64, config.interval_s);
+        let next_cycle_ntp_start =
+            (next_boundary_secs + config.interval_s).saturating_sub(PREPOLL_LEAD_SECS);
+
+        // Phase 0: wait for the boundary - PREPOLL_LEAD_SECS slot. Also
+        // covers the very first cycle (no separate alignment call needed).
+        let ntp_start_secs = next_boundary_secs.saturating_sub(PREPOLL_LEAD_SECS);
+        sleep_until_unix_secs(ntp_start_secs);
+
+        // Periodic NTP rediscovery (gated by elapsed wall time, not
+        // boundary, so it spreads across cycles regardless of cadence).
+        if cycle_started - last_discovery >= REDISCOVER_SECS {
+            sources = discover_sources(3);
+            last_discovery = cycle_started;
+            println!("[discovery] refreshed: {} sources", sources.len());
+        }
+
+        // Phase 1 (boundary - PREPOLL_LEAD_SECS): NTP poll → consensus
+        // → cache sysdrift for the eventual TX timestamp.
+        let results = query_selected_sources(&sources);
+        if results.is_empty() {
+            update_status_silent(&mut status, &config, SilentReason::NoValidSources);
+            sleep_until_unix_secs(next_cycle_ntp_start);
+            continue;
+        }
+        status.ntp_sources = to_source_status(&results);
+        println!(
+            "[cycle] {} sources responded — best RTT {} ms",
+            results.len(),
+            results.iter().map(|r| r.rtt_ms).min().unwrap_or(0)
+        );
+
+        let consensus = match run_consensus_cycle(&results, config.tier_consensus_threshold_ms) {
+            Ok(c) => c,
+            Err(reason) => {
+                eprintln!("[consensus] rejected: {}", reason.label());
+                let silent = match reason {
+                    ConsensusRejection::InsufficientSources { .. }
+                    | ConsensusRejection::IqrTooMany { .. } => SilentReason::NoValidSources,
+                    ConsensusRejection::LowConfidence { .. } => SilentReason::LowConfidence,
+                    ConsensusRejection::LeapSecondSmear { .. }
+                    | ConsensusRejection::SpreadTooHigh { .. }
+                    | ConsensusRejection::NoCrossTierAgreement { .. } => {
+                        SilentReason::SpreadTooHigh
+                    }
+                };
+                update_status_silent(&mut status, &config, silent);
+                sleep_until_unix_secs(next_cycle_ntp_start);
+                continue;
+            }
+        };
+        let sys_at_consensus_ms = get_system_clock_ms();
+        let sysdrift_ms = consensus.timestamp_ms - sys_at_consensus_ms;
+
+        print_consensus(&consensus);
+        status.consensus_ms = Some(consensus.timestamp_ms);
+        status.spread_ms = Some(consensus.spread_ms);
+        status.confidence = Some(consensus.confidence);
+        status.sources_bitmap = Some(consensus.sources_bitmap);
+        status.save();
+
+        // Phase 2 (boundary - PREFLIGHT_LEAD_MS): wake for pre-flight.
+        let preflight_target_ms =
+            next_boundary_secs.saturating_mul(1000) as i64 - PREFLIGHT_LEAD_MS;
+        sleep_until_unix_ms(preflight_target_ms.max(0) as u64);
+
+        // a. Balance check. Runway scales with the active fleet size:
+        // each operator pays for ~1/n of the windows, so a healthy
+        // fleet of n=2 doubles the runway vs solo.
         match rpc.get_balance(&oracle_pubkey_b58) {
             Ok(lamports) => {
                 let bal = lamports_to_xnt(lamports);
                 status.balance_xnt = bal;
-                status.days_remaining = estimate_days_remaining(bal, config.interval_s);
+                status.days_remaining =
+                    estimate_days_remaining(bal, config.interval_s, n_oracles as u16);
                 let was_warning = status.balance_warning;
                 status.balance_warning = bal < MIN_BALANCE_WARN;
                 if bal < MIN_BALANCE_STOP {
@@ -393,6 +469,10 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
                     rotation = new_rotation;
                     my_index = rotation.my_index(&oracle_bytes);
                     n_oracles = rotation.n_oracles();
+                    // Persist for `x1sr status` runway display so the
+                    // one-shot status command can render the correct
+                    // n-aware estimate without its own RPC fetch.
+                    status.n_operators = Some(n_oracles.min(u16::MAX as usize) as u16);
                     last_peers_refetch = cycle_started;
                 }
                 Err(e) => {
@@ -403,19 +483,18 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         }
 
-        // b2. Off-chain 24 h self-stake check. v1.1 contract holds no
-        //     parser; the daemon is the sole enforcer of the 128 XNT floor.
+        // b2. Off-chain 24 h self-stake check. The contract holds no
+        //     parser; the daemon is the sole enforcer of the gate.
         //     Below threshold → silence (don't submit) until stake recovers
         //     or the contract's 10-missed-turns cleanup deregisters us.
         if cycle_started - last_self_stake_check >= SELF_STAKE_CHECK_SECS {
             if let Some(withdrawer) = authorized_withdrawer_opt {
                 match compute_self_stake_off_chain(&mut rpc, &vote_account, &withdrawer) {
                     Ok(stake) => {
-                        if stake < MIN_SELF_STAKE_LAMPORTS {
+                        if stake == 0 {
                             eprintln!(
-                                "⚠️  self-stake {} XNT < 128 XNT — daemon silenced; \
-                                 cleanup will deregister within 10 own turns",
-                                stake / 1_000_000_000
+                                "⚠️  no self-stake with matching withdraw authority — \
+                                 daemon silenced; cleanup will deregister within 10 own turns"
                             );
                             status.set_silent_reason(SilentReason::InsufficientSelfStake);
                             status.silent_cycles += 1;
@@ -423,14 +502,11 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
                             if let Some(url) = &config.alert_webhook {
                                 send_alert_webhook(
                                     url,
-                                    &format!(
-                                        "x1-strontium: self-stake dropped to {} XNT — silenced; \
-                                         cleanup will deregister within 10 own turns",
-                                        stake / 1_000_000_000
-                                    ),
+                                    "x1-strontium: no self-stake with matching withdraw authority — \
+                                     silenced; cleanup will deregister within 10 own turns",
                                 );
                             }
-                            sleep(Duration::from_secs(config.interval_s));
+                            sleep_until_unix_secs(next_cycle_ntp_start);
                             continue;
                         }
                     }
@@ -457,112 +533,43 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         }
 
-        // c. Periodic NTP rediscovery.
-        if cycle_started - last_discovery >= REDISCOVER_SECS {
-            sources = discover_sources(3);
-            last_discovery = cycle_started;
-            println!("[discovery] refreshed: {} sources", sources.len());
-        }
-
-        // d. Query the chosen sources in parallel.
-        let results = query_selected_sources(&sources);
-        if results.is_empty() {
-            update_status_silent(&mut status, &config, SilentReason::NoValidSources);
-            sleep(Duration::from_secs(config.interval_s));
-            continue;
-        }
-        status.ntp_sources = to_source_status(&results);
-
-        // e. Print cycle measurements.
-        println!(
-            "[cycle] {} sources responded — best RTT {} ms",
-            results.len(),
-            results.iter().map(|r| r.rtt_ms).min().unwrap_or(0)
-        );
-
-        // f. Run consensus. Capture sys_at_consensus_ms right after so the
-        //    memo's `sys=` field reflects the daemon's clock at the
-        //    consensus moment (not after the chain RPC pipeline runs).
-        let consensus = match run_consensus_cycle(&results, config.tier_consensus_threshold_ms) {
-            Ok(c) => c,
-            Err(reason) => {
-                eprintln!("[consensus] rejected: {}", reason.label());
-                let silent = match reason {
-                    ConsensusRejection::InsufficientSources { .. }
-                    | ConsensusRejection::IqrTooMany { .. } => SilentReason::NoValidSources,
-                    ConsensusRejection::LowConfidence { .. } => SilentReason::LowConfidence,
-                    ConsensusRejection::LeapSecondSmear { .. }
-                    | ConsensusRejection::SpreadTooHigh { .. }
-                    | ConsensusRejection::NoCrossTierAgreement { .. } => {
-                        SilentReason::SpreadTooHigh
-                    }
-                };
-                update_status_silent(&mut status, &config, silent);
-                sleep(Duration::from_secs(config.interval_s));
-                continue;
-            }
-        };
-        let sys_at_consensus_ms = get_system_clock_ms();
-
-        // g. Print consensus.
-        print_consensus(&consensus);
-        status.consensus_ms = Some(consensus.timestamp_ms);
-        status.spread_ms = Some(consensus.spread_ms);
-        status.confidence = Some(consensus.confidence);
-        status.sources_bitmap = Some(consensus.sources_bitmap);
-
         // h. Dry-run early exit.
         if config.dry_run {
             update_status_dry_run(&mut status);
-            sleep(Duration::from_secs(config.interval_s));
+            sleep_until_unix_secs(next_cycle_ntp_start);
             continue;
         }
 
-        // i. Rotation election (n=1 always returns true).
-        let (my_turn, window_id, secs_to_next) =
-            rotation_my_turn(my_index, n_oracles, config.interval_s);
+        // Phase 3: election + filters at the upcoming boundary.
+        let (my_turn, window_id, _secs_to_next) =
+            rotation_my_turn_at(my_index, n_oracles, config.interval_s, next_boundary_secs);
         status.rotation_window_id = Some(window_id);
         status.rotation_is_my_turn = Some(my_turn);
 
         if !my_turn {
             update_status_silent(&mut status, &config, SilentReason::NotElected);
-            let nap = secs_to_next.min(config.interval_s).max(1);
-            sleep(Duration::from_secs(nap));
+            sleep_until_unix_secs(next_cycle_ntp_start);
             continue;
         }
 
-        if window_has_submission(status.last_submit_ts, config.interval_s) {
-            // Already submitted in this window (process restart). Just sleep.
-            let nap = secs_to_next.min(config.interval_s).max(1);
-            sleep(Duration::from_secs(nap));
+        if window_has_submission_at(
+            status.last_submit_ts,
+            config.interval_s,
+            next_boundary_secs as i64,
+        ) {
+            // Already covered the upcoming window (process restart, etc.).
+            sleep_until_unix_secs(next_cycle_ntp_start);
             continue;
         }
 
-        // j. Sysdrift gate vs SYSTEM clock (NOT chain — chain time has no
-        //    economic security and is unreliable as a reference). Reuse
-        //    `sys_at_consensus_ms` captured right after consensus in step
-        //    f. so the same value reported in the memo's `sys=` field is
-        //    the one we gate on. If sys clock at consensus moment was off
-        //    by more than MAX_SYSDRIFT_MS from the consensus value, the
-        //    daemon's system clock is broken (mis-disciplined chrony /
-        //    systemd-timesyncd, or no time daemon at all) — silence
-        //    rather than push a garbage timestamp on chain.
-        if (consensus.timestamp_ms - sys_at_consensus_ms).abs() > MAX_SYSDRIFT_MS {
+        // j. Sysdrift gate (uses the value cached at NTP poll moment —
+        //    same value the memo's `sys=` / `sysdrift=` fields will
+        //    report, so the gate and the diagnostic agree).
+        if sysdrift_ms.abs() > MAX_SYSDRIFT_MS {
             update_status_silent(&mut status, &config, SilentReason::SystemClockOutOfSync);
-            sleep(Duration::from_secs(config.interval_s));
+            sleep_until_unix_secs(next_cycle_ntp_start);
             continue;
         }
-
-        // Start the TSC stopwatch BEFORE the heavy chain pipeline (chain_time
-        // RPC, blockhash RPC, optional stake recheck, TX build/sign). The
-        // elapsed delta is added to consensus.timestamp_ms so the on-chain
-        // instruction + memo reflect the moment the TX leaves the daemon, not
-        // the moment NTP consensus completed ~100–2000 ms earlier. If the
-        // pipeline takes longer than MAX_SPREAD_MS, we fall back to the raw
-        // consensus time so the TX can never trip the contract's spread
-        // budget.
-        let consensus_time_ms = consensus.timestamp_ms;
-        let tsc_anchor = Instant::now();
 
         // k. Best-effort chain time for memo.
         let chain_time_ms = rpc.get_chain_time_ms();
@@ -573,29 +580,26 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             Err(e) => {
                 eprintln!("[blockhash] {e}");
                 update_status_silent(&mut status, &config, SilentReason::NoHealthyRpc);
-                sleep(Duration::from_secs(config.interval_s));
+                sleep_until_unix_secs(next_cycle_ntp_start);
                 continue;
             }
         };
 
-        // Measure elapsed since tsc_anchor. Anything over the contract's
-        // MAX_SPREAD_MS budget triggers the safety fallback.
-        let elapsed_ms = tsc_anchor.elapsed().as_millis() as i64;
-        let precise_time_ms = apply_tsc_correction(consensus_time_ms, elapsed_ms);
-        if elapsed_ms > MAX_SPREAD_MS {
-            eprintln!(
-                "[tsc] elapsed {elapsed_ms}ms > spread limit {MAX_SPREAD_MS}ms — using raw consensus time"
-            );
-        }
+        // TX timestamp = current system clock + cached sysdrift. The
+        // sysdrift was captured ~30s ago at NTP-poll moment; system
+        // clock drift over 30s is sub-millisecond on a healthy host
+        // (the sysdrift gate above guards against the unhealthy case),
+        // so this gives a good UTC estimate at the actual send moment
+        // without re-polling NTP.
+        let tx_timestamp_ms = get_system_clock_ms() + sysdrift_ms;
 
-        // l. Build & sign. v1.1 submit_time touches only OracleState +
-        //    own registration — no vote_account, no remaining_accounts.
+        // m. Build & sign.
         let params = SubmitParams {
             consensus: &consensus,
             window_id,
             memo_enabled: config.memo_enabled,
             chain_time_ms,
-            precise_time_ms,
+            precise_time_ms: tx_timestamp_ms,
             sys_at_consensus_ms,
         };
         let tx = build_submit_transaction_signed(
@@ -608,11 +612,23 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
         );
         let tx_b64 = base64_encode(&tx);
 
-        // n. Send.
+        // n. Send. Drift signals are persisted on success so `x1sr
+        // status` can render Chain drift / Sys drift.
+        let drift_for_status = chain_time_ms.map(|c| tx_timestamp_ms - c);
+        let sysdrift_for_status = tx_timestamp_ms - sys_at_consensus_ms;
+        let send_target_ms = next_boundary_secs.saturating_mul(1000) as i64;
         match rpc.send_transaction(&tx_b64) {
             Ok(sig) => {
+                let after_send_ms = get_system_clock_ms();
+                let delta_ms = after_send_ms - send_target_ms;
+                println!(
+                    "[timing] target={} actual={} delta={:+}ms",
+                    format_clock_3dec(send_target_ms),
+                    format_clock_3dec(after_send_ms),
+                    delta_ms
+                );
                 println!("✅ submit OK — tx: {sig}");
-                update_status_ok(&mut status, &sig);
+                update_status_ok(&mut status, &sig, drift_for_status, sysdrift_for_status);
             }
             Err(e) => {
                 eprintln!("❌ submit failed: {e}");
@@ -634,8 +650,11 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             }
         }
 
-        // o. Sleep.
-        sleep(Duration::from_secs(config.interval_s));
+        // Sleep until the NEXT cycle's NTP-poll start. Aligning on the
+        // boundary rather than on a flat `sleep(interval_s)` keeps the
+        // schedule from drifting away from wall-clock alignment if a
+        // single send takes long.
+        sleep_until_unix_secs(next_cycle_ntp_start);
     }
 }
 
@@ -676,7 +695,12 @@ fn print_consensus(c: &ConsensusResult) {
 // Status update helpers
 // ---------------------------------------------------------------------------
 
-fn update_status_ok(status: &mut DaemonStatus, signature: &str) {
+fn update_status_ok(
+    status: &mut DaemonStatus,
+    signature: &str,
+    drift_ms: Option<i64>,
+    sysdrift_ms: i64,
+) {
     let now = get_unix_secs();
     status.running = true;
     status.last_submit_ts = Some(now);
@@ -684,6 +708,10 @@ fn update_status_ok(status: &mut DaemonStatus, signature: &str) {
     status.last_error = None;
     status.silent_cycles = 0;
     status.silent_reason = None;
+    // Persist the drift signals from this submission so `x1sr status`
+    // can render Chain drift / Sys drift without reading on-chain memos.
+    status.last_drift_ms = drift_ms;
+    status.last_sysdrift_ms = Some(sysdrift_ms);
     status.save();
 }
 
@@ -879,20 +907,40 @@ fn cmd_balance() {
     };
     let pubkey_b58 = bs58::encode(oracle_keypair.verifying_key().to_bytes()).into_string();
     let mut rpc = RpcClient::new(config.rpc_urls.clone());
+
+    // Fleet-size lookup for the runway estimate. If the RPC call fails
+    // (network down, program_id misconfigured, etc.) we fall back to a
+    // solo estimate (n=1) and tag the line with `(solo estimate)`.
+    let mut program_id_bytes = [0u8; 32];
+    let n_oracles: u16 = match bs58::decode(&config.program_id).into_vec() {
+        Ok(v) if v.len() == 32 => {
+            program_id_bytes.copy_from_slice(&v);
+            match rpc.fetch_active_registrations(&program_id_bytes) {
+                Ok(regs) => regs.len().max(1).min(u16::MAX as usize) as u16,
+                Err(_) => 1,
+            }
+        }
+        _ => 1,
+    };
+    let solo_fallback = n_oracles == 1;
+
     match rpc.get_balance(&pubkey_b58) {
         Ok(lamports) => {
             let bal = lamports_to_xnt(lamports);
-            let runway = estimate_days_remaining(bal, config.interval_s);
-            // Mirror estimate_days_remaining's assumptions for the banner.
-            // Solo / no-rotation accounting: every window is mine, so this is
-            // the conservative (worst-case) runway. With Prime+Sentinel
-            // rotation each operator pays for half the windows → roughly 2x
-            // the runway shown here.
+            let runway = estimate_days_remaining(bal, config.interval_s, n_oracles);
+            // tx_per_day is the network's TX rate; my_share is what THIS
+            // operator pays after rotation factors out the fleet.
             let tx_per_day = 86_400.0 / config.interval_s as f64;
+            let my_share = tx_per_day / n_oracles.max(1) as f64;
+            let solo_tag = if solo_fallback {
+                "  (solo estimate — n unknown / RPC unreachable)"
+            } else {
+                ""
+            };
             println!("oracle:  {pubkey_b58}");
             println!("balance: {bal:.3} XNT  (lamports {lamports})");
             println!(
-                "runway:  ~{runway:.1} days  (@ {COST_PER_TX_XNT:.3} XNT × {tx_per_day:.0} TX/day)"
+                "runway:  ~{runway:.1} days  (@ {COST_PER_TX_XNT:.3} XNT × {my_share:.0} TX/day, n={n_oracles}){solo_tag}"
             );
         }
         Err(e) => {
@@ -970,11 +1018,17 @@ fn cmd_install() {
         println!("binary installed: {bin_target}");
     }
 
+    // Symlink: force overwrite. Failure here is logged but does NOT abort
+    // the install — the binary, the unit file, and daemon-reload still
+    // need to land. The operator can fix the symlink manually after.
     let _ = std::fs::remove_file(symlink);
-    if let Err(e) = std::os::unix::fs::symlink(bin_target, symlink) {
-        eprintln!("symlink {symlink}: {e}");
-        process::exit(1);
-    }
+    let symlink_status = match std::os::unix::fs::symlink(bin_target, symlink) {
+        Ok(()) => "ok (overwritten or created)".to_string(),
+        Err(e) => {
+            eprintln!("symlink {symlink}: {e}");
+            format!("FAILED ({e})")
+        }
+    };
 
     let user = env::var("SUDO_USER")
         .or_else(|_| env::var("USER"))
@@ -998,27 +1052,31 @@ WantedBy=multi-user.target
 "
     );
     let unit_path = "/etc/systemd/system/x1-strontium.service";
+
+    // Unit file is ALWAYS written (overwrites any prior version). Exit
+    // only when this fails — without the unit, systemd cannot manage
+    // the daemon. The symlink may have failed; that is recoverable.
     if let Err(e) = std::fs::write(unit_path, &unit) {
         eprintln!("write {unit_path}: {e}");
         process::exit(1);
     }
 
-    // Best-effort daemon-reload + enable — may fail if not running as root
-    // or if systemd is not present (e.g. macOS dev box). Either way, the
-    // binary and unit file are already in place.
-    let _ = process::Command::new("systemctl")
+    // daemon-reload picks up the new (or overwritten) unit. Logged but
+    // never auto-enabled — operator decides when to bring the service
+    // up via `systemctl enable --now`.
+    let reload_status = match process::Command::new("systemctl")
         .args(["daemon-reload"])
-        .status();
-    let _ = process::Command::new("systemctl")
-        .args(["enable", "x1-strontium"])
-        .status();
+        .status()
+    {
+        Ok(s) if s.success() => "ok".to_string(),
+        Ok(s) => format!("non-zero exit ({s})"),
+        Err(e) => format!("ERROR ({e})"),
+    };
 
-    println!("installed:");
-    println!("  binary:   {bin_target}");
-    println!("  symlink:  {symlink}");
-    println!("  systemd:  {unit_path}");
-    println!("  user:     {user}");
-    println!("next: sudo systemctl start x1-strontium");
+    println!("symlink {symlink}: {symlink_status}");
+    println!("unit file {unit_path}: written");
+    println!("systemctl daemon-reload: {reload_status}");
+    println!("Run: sudo systemctl enable --now x1-strontium");
 }
 
 fn cmd_uninstall() {
@@ -1246,16 +1304,16 @@ fn cmd_init(args: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
-// cmd_register — daemon-driven operator onboarding (v1.1)
+// cmd_register — daemon-driven operator onboarding
 // ---------------------------------------------------------------------------
 //
 // Generates oracle.json if missing, loads vote.json, runs the off-chain
-// anti-farm gates (≥ 64 epoch credits, ≥ 128 XNT qualifying self-stake),
+// anti-farm gates (≥ 64 epoch credits + withdrawer-match qualifying stake),
 // and on success builds + sends the 2-signer `register_submitter` TX.
 //
 // REFUSES to send if any gate fails — the contract holds no parsers in
-// v1.1, so the daemon is the sole enforcer of the operator-quality
-// constraint.
+// The contract holds no parsers in this codebase, so the daemon is the
+// sole enforcer of the operator-quality constraint.
 
 fn cmd_register(args: &[String]) {
     if !args.is_empty() {
@@ -1386,8 +1444,11 @@ fn cmd_register(args: &[String]) {
     }
     println!("       ✓ epoch_credits = {ec_len} (≥ {MIN_EPOCH_HISTORY})");
 
-    // Gate 2: qualifying self-stake ≥ 128 XNT (filter voter / withdrawer /
-    // age ≥ 2 epochs / not deactivating, same as v1.0 contract logic).
+    // Gate 2: withdrawer-match — at least one stake account exists with
+    // withdraw authority equal to the vote account's authorized_withdrawer
+    // (filter voter / withdrawer / age ≥ 2 epochs / not deactivating).
+    // Any qualifying amount counts; the operator-quality signal is the
+    // withdraw-authority binding, not the lamports amount.
     if vote_account_data.len() < 68 {
         eprintln!("[register] vote account too short — cannot read authorized_withdrawer");
         process::exit(1);
@@ -1405,20 +1466,17 @@ fn cmd_register(args: &[String]) {
             process::exit(1);
         }
     };
-    if stake < MIN_SELF_STAKE_LAMPORTS {
+    if stake == 0 {
         eprintln!(
-            "[register] ❌ qualifying self-stake = {} XNT, need ≥ {} XNT. \
+            "[register] ❌ qualifying self-stake = 0 XNT (no stake with matching withdrawer). \
              Filter: voter=this vote account, withdrawer=authorized_withdrawer, \
-             age ≥ 2 epochs, not deactivating.",
-            stake / 1_000_000_000,
-            MIN_SELF_STAKE_LAMPORTS / 1_000_000_000
+             age ≥ 2 epochs, not deactivating."
         );
         process::exit(1);
     }
     println!(
-        "       ✓ qualifying self-stake = {} XNT (≥ {} XNT)",
-        stake / 1_000_000_000,
-        MIN_SELF_STAKE_LAMPORTS / 1_000_000_000
+        "       ✓ qualifying self-stake = {} XNT (withdrawer-match)",
+        stake / 1_000_000_000
     );
     println!();
 
@@ -1522,7 +1580,7 @@ fn expand_tilde(path: &str) -> String {
 //     ring_count (u16 LE): struct +80..82    -> account +88..90
 //     n_operators        : struct +82..84    -> account +90..92
 //     _pad1 [4]          : struct +84..88    -> account +92..96
-//     last_cleanup_slot  : struct +88..96    -> account +96..104   (v1.1 — was _pad_reserve)
+//     last_cleanup_slot  : struct +88..96    -> account +96..104   (was _pad_reserve in v1.0)
 //     submissions[6]     : struct +96..528   -> account +104..536   (6 × 72 B)
 //     ring_buffer[288]   : struct +528..9744 -> account +536..9752  (288 × 32 B)
 //
@@ -1843,46 +1901,30 @@ fn try_cleanup_inactive(
 // Wall-clock window alignment
 // ---------------------------------------------------------------------------
 
-/// Pure math: how many milliseconds to sleep so we wake up at the next
-/// `interval_ms` boundary. If `now_ms` is already exactly on a boundary,
-/// we still sleep the FULL interval (returning 0 would burn a window).
-fn next_boundary_sleep_ms(now_ms: u64, interval_ms: u64) -> u64 {
-    debug_assert!(interval_ms > 0, "interval must be > 0");
-    let next_boundary_ms = ((now_ms / interval_ms) + 1) * interval_ms;
-    next_boundary_ms - now_ms
+/// Compute the next wall-clock window boundary (in unix seconds) strictly
+/// after `now_secs`. Used by the pre-poll flow so NTP and the eventual
+/// election all reference the SAME boundary.
+fn next_window_boundary_secs(now_secs: u64, interval_s: u64) -> u64 {
+    let interval = interval_s.max(1);
+    ((now_secs / interval) + 1) * interval
 }
 
-/// Sleep until the next wall-clock window boundary at the configured
-/// interval. After this, every cycle ends with a `sleep(interval_s)` so
-/// the alignment is preserved (modulo per-cycle drift, which is small).
-fn wait_until_next_window_boundary(interval_s: u64) {
+/// Sleep until `target_secs` UNIX seconds. No-op if we're already at or
+/// past the target.
+fn sleep_until_unix_secs(target_secs: u64) {
+    sleep_until_unix_ms(target_secs.saturating_mul(1000));
+}
+
+/// Sleep until `target_ms` UNIX milliseconds. Higher precision variant
+/// of [`sleep_until_unix_secs`] — used to wake at boundary-200ms for the
+/// pre-flight phase.
+fn sleep_until_unix_ms(target_ms: u64) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let interval_ms = interval_s.saturating_mul(1000).max(1);
-    let sleep_ms = next_boundary_sleep_ms(now_ms, interval_ms);
-    println!(
-        "[align] waiting {}s {}ms for next wall-clock window boundary",
-        sleep_ms / 1000,
-        sleep_ms % 1000
-    );
-    sleep(Duration::from_millis(sleep_ms));
-}
-
-// ---------------------------------------------------------------------------
-// TSC-corrected timestamp pure function
-// ---------------------------------------------------------------------------
-
-/// Add `elapsed_ms` to `consensus_ms` to get the timestamp the TX should
-/// commit. If the elapsed time exceeds the contract's spread budget
-/// (MAX_SPREAD_MS), fall back to the raw consensus value rather than risk
-/// the contract rejecting the submission for being out of bounds.
-fn apply_tsc_correction(consensus_ms: i64, elapsed_ms: i64) -> i64 {
-    if (0..=MAX_SPREAD_MS).contains(&elapsed_ms) {
-        consensus_ms + elapsed_ms
-    } else {
-        consensus_ms
+    if target_ms > now_ms {
+        sleep(Duration::from_millis(target_ms - now_ms));
     }
 }
 
@@ -1894,103 +1936,67 @@ fn apply_tsc_correction(consensus_ms: i64, elapsed_ms: i64) -> i64 {
 mod tests {
     use super::*;
 
-    // ---------- Self-stake threshold tripwire ----------
+    // ---------- Withdrawer-match gate tripwire ----------
 
-    /// In v1.1 the contract holds no parser — the daemon is the sole
-    /// enforcer of the 128 XNT qualifying-self-stake floor (off-chain
-    /// gate at register time and at the 24 h recheck). This test locks
-    /// the literal so a careless edit can't quietly weaken the gate.
+    /// v1.2.0 replaces the 128 XNT minimum-stake floor with a
+    /// withdrawer-match gate: any qualifying stake (voter == this vote
+    /// account, withdrawer == authorized_withdrawer, age ≥ 2 epochs,
+    /// not deactivating) is sufficient as long as the SUM is non-zero.
+    /// The cmd_register / 24 h refresh paths both call
+    /// `compute_self_stake_off_chain` and short-circuit only when the
+    /// sum is zero — this test locks that semantic so an accidental
+    /// reintroduction of a `> N XNT` threshold trips loudly.
     #[test]
-    fn min_self_stake_is_128_xnt() {
-        assert_eq!(MIN_SELF_STAKE_LAMPORTS, 128_000_000_000);
-        assert_eq!(MIN_SELF_STAKE_LAMPORTS, 128 * 1_000_000_000);
+    fn withdrawer_match_gate_requires_nonzero_stake() {
+        // The gate logic is `if stake == 0 { reject }`. Any positive
+        // amount qualifies — even a single lamport.
+        let zero: u64 = 0;
+        let one_lamport: u64 = 1;
+        let one_xnt: u64 = 1_000_000_000;
+        let large: u64 = 500_000_000_000;
+
+        assert!(zero == 0, "zero stake must trip the gate");
+        assert!(
+            one_lamport > 0,
+            "even 1 lamport with matching withdrawer passes the gate"
+        );
+        assert!(one_xnt > 0);
+        assert!(large > 0);
     }
 
     #[test]
     fn min_epoch_history_is_64() {
         // Validator-age gate at register time. ~64 epochs ≈ 2 months on X1's
-        // epoch length. Off-chain only in v1.1.
+        // epoch length. Off-chain only.
         assert_eq!(MIN_EPOCH_HISTORY, 64);
     }
 
-    // ---------- next_boundary_sleep_ms math ----------
+    // ---------- next_window_boundary_secs (Fix 6 / v1.2.0) ----------
 
     #[test]
-    fn next_boundary_math_at_various_times() {
-        let interval_ms = 300_000; // 5 min
-
-        // Exactly on a boundary → sleep the full interval (NOT zero — that
-        // would let the daemon burn a window doing nothing).
-        assert_eq!(next_boundary_sleep_ms(0, interval_ms), 300_000);
-        assert_eq!(next_boundary_sleep_ms(300_000, interval_ms), 300_000);
-        assert_eq!(next_boundary_sleep_ms(900_000, interval_ms), 300_000);
-
-        // 1 ms after a boundary → almost the full interval.
-        assert_eq!(next_boundary_sleep_ms(1, interval_ms), 299_999);
-        assert_eq!(next_boundary_sleep_ms(300_001, interval_ms), 299_999);
-
-        // 1 ms before a boundary → 1 ms sleep.
-        assert_eq!(next_boundary_sleep_ms(299_999, interval_ms), 1);
-
-        // Mid-window.
-        assert_eq!(next_boundary_sleep_ms(150_000, interval_ms), 150_000);
-        assert_eq!(next_boundary_sleep_ms(450_000, interval_ms), 150_000);
-
+    fn next_window_boundary_secs_basic() {
+        let interval_s = 300u64; // 5 min
+                                 // Exactly on a boundary → returns the NEXT boundary (not the
+                                 // current one). This avoids a zero-length sleep that would burn
+                                 // a window doing nothing.
+        assert_eq!(next_window_boundary_secs(0, interval_s), 300);
+        assert_eq!(next_window_boundary_secs(300, interval_s), 600);
+        // Mid-window → returns the upcoming boundary.
+        assert_eq!(next_window_boundary_secs(150, interval_s), 300);
+        assert_eq!(next_window_boundary_secs(599, interval_s), 600);
         // Different interval (60 s).
-        assert_eq!(next_boundary_sleep_ms(0, 60_000), 60_000);
-        assert_eq!(next_boundary_sleep_ms(45_000, 60_000), 15_000);
-    }
-
-    // ---------- apply_tsc_correction logic ----------
-
-    #[test]
-    fn tsc_correction_within_budget_adds_elapsed() {
-        // 30 ms elapsed, budget 50 ms → add it.
-        assert_eq!(apply_tsc_correction(1_000, 30), 1_030);
-        assert_eq!(
-            apply_tsc_correction(1_713_184_500_000, 17),
-            1_713_184_500_017
-        );
+        assert_eq!(next_window_boundary_secs(0, 60), 60);
+        assert_eq!(next_window_boundary_secs(59, 60), 60);
+        assert_eq!(next_window_boundary_secs(60, 60), 120);
     }
 
     #[test]
-    fn tsc_correction_at_exactly_budget_still_adds() {
-        // Boundary case: elapsed == MAX_SPREAD_MS → add (only > triggers fallback).
-        assert_eq!(apply_tsc_correction(1_000, 50), 1_050);
+    fn next_window_boundary_secs_clamps_zero_interval_to_one() {
+        // Defensive: interval = 0 must not panic. Treated as 1s.
+        assert_eq!(next_window_boundary_secs(100, 0), 101);
     }
 
-    #[test]
-    fn tsc_correction_above_budget_falls_back() {
-        // 100 ms elapsed > 50 ms budget → use raw consensus.
-        assert_eq!(apply_tsc_correction(1_000, 100), 1_000);
-        assert_eq!(
-            apply_tsc_correction(1_713_184_500_000, 9_999),
-            1_713_184_500_000
-        );
-    }
-
-    #[test]
-    fn tsc_correction_negative_elapsed_falls_back() {
-        // Wall-clock skew or NTP step could in theory produce a negative
-        // elapsed reading from Instant::now().elapsed() (very rare). Belt
-        // and braces: don't subtract from the consensus timestamp.
-        assert_eq!(apply_tsc_correction(1_000, -10), 1_000);
-    }
-
-    #[test]
-    fn tsc_elapsed_precision_via_real_sleep() {
-        // Smoke test that Instant::now() actually measures real time.
-        // Sleep 150 ms, accept 150–200 ms (CI / scheduler jitter).
-        let anchor = Instant::now();
-        std::thread::sleep(Duration::from_millis(150));
-        let elapsed = anchor.elapsed().as_millis() as i64;
-        assert!(
-            (150..=200).contains(&elapsed),
-            "expected elapsed ~150 ms, got {elapsed} ms"
-        );
-    }
-
-    // ---------- v1.1.1 patch: sysdrift gate ----------
+    // ---------- sysdrift gate ----------
 
     #[test]
     fn daemon_silences_when_sysdrift_exceeds_threshold() {

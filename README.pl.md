@@ -14,7 +14,7 @@ sieci głównej X1. Każdy program X1 może następnie wywołać `read_time`
 przez CPI, aby uzyskać wiarygodny zegar — bez polegania na zawodnym
 on-chainowym `Clock::unix_timestamp`.
 
-**v1.1.1** to upgrade in-place, który zastępuje proces onboardingu
+**v1.2.0** to upgrade in-place, który zastępuje proces onboardingu
 operatorów prostszym modelem opartym o pliki kluczy. Program ID jest
 zachowany (deploy przez `solana program deploy --program-id <existing>`),
 ale OracleState PDA dostaje czwarty segment seedów, więc PDA z v1.0
@@ -45,7 +45,7 @@ brakującego certyfikowanego źródła czasu.
 
 ---
 
-## Szybkie fakty (mainnet v1.1.1)
+## Szybkie fakty (mainnet v1.2.0)
 
 | Pole                    | Wartość                                                |
 |-------------------------|--------------------------------------------------------|
@@ -58,7 +58,7 @@ brakującego certyfikowanego źródła czasu.
 | Okno agregacji          | 150 slotów (~60 s)                                     |
 | Głębokość ring buffera  | 288 wpisów (24 h historii przy 5-minutowym interwale)  |
 | Quorum                  | 10 % zarejestrowanych operatorów, min 1, max 6         |
-| Minimalny self-stake    | 128 XNT na operatora (gate off-chain)                  |
+| Minimalny self-stake    | withdrawer-match: withdraw authority stake'a musi być równy authorized_withdrawer konta vote (gate off-chain) |
 | Minimalny wiek walidat. | 64 epoki historii głosowania (gate off-chain)          |
 | Próg auto-cleanup       | 10 własnych kolei rotacji opuszczonych z rzędu         |
 | Rozmiar konta on-chain  | 9744 B (488 B zapasu pod limitem 10 240 B CPI X1)      |
@@ -67,7 +67,7 @@ brakującego certyfikowanego źródła czasu.
 Wycofany (zamknięty on-chain) Program ID v0.5 wyłącznie do odniesienia:
 `2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`.
 
-**Tryb bootstrap (v1.1.1+).** Strontium raportuje `is_degraded = 1`
+**Tryb bootstrap.** Strontium raportuje `is_degraded = 1`
 niezależnie od per-okna quorum i confidence dopóki aktywna pula
 operatorów jest mniejsza niż `MIN_QUORUM_ABSOLUTE = 3`. dApps powinny
 traktować `is_degraded = 1` jako sygnał do fallbacku na alternatywne
@@ -118,10 +118,11 @@ jednorazowym bootstrapem przez portfel sprzętowy. Dołączenie do zbioru
 operatorów wymaga:
 
 1. **Aktywnego walidatora X1** z co najmniej 64 epokami historii
-   głosowania (~2 miesiące aktywności) i self-stake ≥ 128 XNT, gdzie
-   withdraw authority stake'a równa się `authorized_withdrawer` konta
-   vote walidatora. To są anti-farm gates weryfikowane off-chain przez
-   daemona w momencie rejestracji oraz co 24 godziny.
+   głosowania (~2 miesiące aktywności) i self-stake, którego withdraw
+   authority równa się `authorized_withdrawer` konta vote walidatora
+   (withdrawer-match gate — liczy się każda kwota). To są anti-farm
+   gates weryfikowane off-chain przez daemona w momencie rejestracji
+   oraz co 24 godziny.
 
 2. **Jednorazowego transferu XNT** z portfela sprzętowego (Ledger,
    Trezor, lub dowolnego innego) trzymającego withdraw authority
@@ -240,9 +241,9 @@ akceptowalne wyniki.
 
 - **Wymuszanie anti-farm off-chain** — daemon odmawia rejestracji lub
   submisji, jeśli walidator ma mniej niż 64 epoki historii głosowania
-  lub kwalifikujący self-stake poniżej 128 XNT. Kontrakt nie zawiera
-  parserów; gates żyją w open-sourcowym kodzie daemona, który każdy
-  może zaudytować.
+  lub nie ma self-stake'a z pasującym withdraw authority (withdrawer-
+  match gate). Kontrakt nie zawiera parserów; gates żyją w open-sourcowym
+  kodzie daemona, który każdy może zaudytować.
 
 - **Auto-cleanup nieaktywnych operatorów** — kontrakt usuwa
   operatorów, którzy opuścili 10 swoich kolejnych kolei rotacji z
@@ -261,14 +262,10 @@ akceptowalne wyniki.
 
 ## Roadmap
 
-- **v1.1** (ten release) — model file-based oracle, 2-podpisowa
-  `register_submitter`, off-chainowe gates anti-farm, permissionless
-  `cleanup_inactive`, upgrade programu in-place.
-
-- **v1.2** — pomocnik CPI `read_time_smoothed(windows)` czytający N
-  ostatnich wpisów ringu, odrzucający odstające i zwracający medianę.
-  Przydatne dla konsumentów preferujących wyjście monotonne o niskim
-  jitterze nad ścisłą semantykę "najświeższa próbka".
+- **v1.2.0** (ten release) — kalkulacja runway uwzględnia rozmiar
+  fleeta n, naprawa install (unit file zawsze zapisany), cichy fallback
+  RPC, chain drift + sysdrift w outpucie status, pre-computation NTP
+  polling (sub-200ms timing TX), withdrawer-match gate stake.
 
 - **v1.3** — prawdziwa autoryzacja NTS-KE na endpointach z obsługą NTS.
   Dziś daemon odpytuje te serwery zwykłym NTP; label tieru `nts` jest
