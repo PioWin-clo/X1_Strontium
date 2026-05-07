@@ -69,12 +69,29 @@ jobs:
           ls -lh "$BIN"
           ./"$BIN" --help | head -3
 
-      - name: Stage release artifacts (final asset names + sha256)
+      - name: Rename binary for release upload
         run: |
+          # Copy the freshly built+stripped binary to its final upload
+          # name. Done as a separate step so the SHA256 step below has
+          # an unambiguous "use this exact file" target in the workspace.
           cp target/x86_64-unknown-linux-musl/release/x1-strontium x1-strontium-linux-x86_64
-          sha256sum x1-strontium-linux-x86_64 > x1-strontium.sha256
-          cat x1-strontium.sha256
           ls -lh x1-strontium-linux-x86_64
+
+      - name: Generate SHA256 of newly built binary
+        run: |
+          # Regenerate the checksum file FROM SCRATCH against the binary
+          # produced by THIS workflow run. Any pre-existing
+          # `x1-strontium.sha256` (e.g. left over from a prior run that
+          # somehow leaked into the workspace) is removed first, so the
+          # release never publishes a stale hash.
+          rm -f x1-strontium.sha256
+          sha256sum x1-strontium-linux-x86_64 > x1-strontium.sha256
+          echo "Computed hash:"
+          cat x1-strontium.sha256
+          # Self-check: verify the just-written file actually matches
+          # the binary on disk. Catches any race / cache / copy error
+          # before the release upload step ships a broken pair.
+          sha256sum -c x1-strontium.sha256
 
       - name: Determine release tag
         id: tag
