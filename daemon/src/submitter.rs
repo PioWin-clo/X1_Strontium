@@ -168,16 +168,28 @@ impl RpcClient {
     where
         F: FnMut(&str) -> Result<T, String>,
     {
-        let mut last_err = String::from("no rpc endpoints configured");
+        if self.urls.is_empty() {
+            return Err("no rpc endpoints configured".to_string());
+        }
         let now = Self::now_secs();
-        // Track the first endpoint that failed in this call so a
-        // successful fallback can log it (debug-only, gated by
-        // X1SR_DEBUG env var to avoid noisy production logs). The error
-        // log fires only when ALL endpoints fail (the final Err return).
+
+        // Bypass cooldowns when EVERY URL is on cooldown — otherwise the
+        // daemon would deadlock for 5 minutes on "no rpc endpoints
+        // configured" even though some endpoint might be reachable
+        // again. This was the root cause of the v1.2.0 submit_time DNS
+        // fallback bug: once a noisy cycle pushed both endpoints past
+        // the 3-fail threshold, every subsequent call returned the
+        // generic error and silently aborted the cycle.
+        let bypass_cooldown = (0..self.urls.len()).all(|i| self.cooldown_until[i] > now);
+
+        // Per-URL error log so the final Err message names the actual
+        // endpoint(s) that failed, not just the last one tried. Helps
+        // operators diagnose DNS-vs-RPC-vs-firewall issues from logs.
+        let mut errors: Vec<String> = Vec::with_capacity(self.urls.len());
         let mut first_failed: Option<String> = None;
 
         for i in 0..self.urls.len() {
-            if self.cooldown_until[i] > now {
+            if !bypass_cooldown && self.cooldown_until[i] > now {
                 continue;
             }
             match op(&self.urls[i]) {
@@ -190,14 +202,18 @@ impl RpcClient {
                             );
                         }
                     }
+                    // Healthy endpoint: clear both counter AND any
+                    // outstanding cooldown so the recovery isn't
+                    // shadowed by a stale block.
                     self.fail_counts[i] = 0;
+                    self.cooldown_until[i] = 0;
                     return Ok(v);
                 }
                 Err(e) => {
                     if first_failed.is_none() {
                         first_failed = Some(self.urls[i].clone());
                     }
-                    last_err = e;
+                    errors.push(format!("{}: {e}", self.urls[i]));
                     self.fail_counts[i] += 1;
                     if self.fail_counts[i] >= 3 {
                         self.cooldown_until[i] = now + 5 * 60;
@@ -206,7 +222,7 @@ impl RpcClient {
                 }
             }
         }
-        Err(last_err)
+        Err(format!("all rpc endpoints failed: [{}]", errors.join("; ")))
     }
 
     pub fn get_recent_blockhash(&mut self) -> Result<[u8; 32], String> {
@@ -992,12 +1008,16 @@ pub fn build_register_transaction(
 
 /// Build and sign a `cleanup_inactive` Anchor transaction with a batch of
 /// candidate `ValidatorRegistration` PDAs in `remaining_accounts` (all
-/// passed as writable). The fee payer is also the lone signer; the
-/// instruction itself takes no signer-derived state, so any caller can
-/// invoke it. The contract iterates the batch, marks any operator that
-/// has missed strictly more than `MAX_MISSED_TURNS` of their own rotation
-/// turns as `is_active = false`, and recomputes `n_operators` /
-/// `quorum_threshold` / `last_cleanup_slot` accordingly.
+/// passed as writable). The fee payer is also the lone signer; lamports
+/// from any closed PDA flow back to this same key (the contract uses
+/// `payer` both as `Signer<'info>` and as the destination of
+/// `acct.close()`). The contract iterates the batch and CLOSES any
+/// stale `ValidatorRegistration` PDA (lamports → payer, data zeroed,
+/// discriminator overwritten with `CLOSED_ACCOUNT_DISCRIMINATOR`),
+/// recomputing `n_operators` / `quorum_threshold` / `last_cleanup_slot`.
+/// v1.2.1 fix: prior versions only flipped `is_active = false`, which
+/// left the PDA on chain and prevented re-registration with the same
+/// `oracle_keypair`.
 pub fn build_cleanup_inactive_transaction(
     fee_payer: &SigningKey,
     program_id: &[u8; 32],
@@ -1042,10 +1062,13 @@ pub fn build_cleanup_inactive_transaction(
             .expect("ordered_keys must contain all referenced accounts") as u8
     };
 
-    // CleanupInactive Anchor derive order: oracle_state + remaining_accounts
+    // CleanupInactive Anchor derive order (v1.2.1):
+    //   [0] oracle_state    (writable, PDA)
+    //   [1] payer           (writable, signer — receives closed-PDA lamports)
+    //   [2..] remaining_accounts (writable, registration PDAs)
     let discriminator = anchor_discriminator("cleanup_inactive");
     let ix_data: Vec<u8> = discriminator.to_vec();
-    let mut ix_accounts: Vec<u8> = vec![idx(oracle_pda)];
+    let mut ix_accounts: Vec<u8> = vec![idx(oracle_pda), idx(&payer_pubkey)];
     for r in &regs {
         ix_accounts.push(idx(r));
     }
@@ -1611,6 +1634,321 @@ mod tests {
             (big / solo - 100.0).abs() < 0.5,
             "expected ~100x runway, got ratio {}",
             big / solo
+        );
+    }
+
+    // ---------- RpcClient::rpc_call_with_retry (BUG 1 v1.2.1) ----------
+
+    #[test]
+    fn rpc_retry_empty_urls_returns_specific_error() {
+        let mut rpc = RpcClient::new(vec![]);
+        let r: Result<(), String> = rpc.rpc_call_with_retry(|_| Ok(()));
+        assert_eq!(r, Err("no rpc endpoints configured".to_string()));
+    }
+
+    #[test]
+    fn rpc_retry_succeeds_on_first_url_when_healthy() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let mut calls: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            calls.push(url.to_string());
+            Ok::<_, String>(42u32)
+        });
+        assert_eq!(r, Ok(42));
+        assert_eq!(calls, vec!["https://primary"]);
+        assert_eq!(rpc.fail_counts, vec![0, 0]);
+        assert_eq!(rpc.cooldown_until, vec![0, 0]);
+    }
+
+    #[test]
+    fn rpc_retry_falls_back_to_secondary_when_primary_fails() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let mut calls: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            calls.push(url.to_string());
+            if url == "https://primary" {
+                Err::<u32, _>("dns error".to_string())
+            } else {
+                Ok(7u32)
+            }
+        });
+        assert_eq!(r, Ok(7));
+        assert_eq!(calls, vec!["https://primary", "https://secondary"]);
+        // Primary failed once → fail_count=1, no cooldown yet (threshold=3).
+        assert_eq!(rpc.fail_counts[0], 1);
+        assert_eq!(rpc.cooldown_until[0], 0);
+        // Secondary succeeded → counter and cooldown both cleared.
+        assert_eq!(rpc.fail_counts[1], 0);
+        assert_eq!(rpc.cooldown_until[1], 0);
+    }
+
+    #[test]
+    fn rpc_retry_all_fail_returns_per_url_diagnostics() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let r: Result<u32, String> = rpc.rpc_call_with_retry(|url| {
+            if url == "https://primary" {
+                Err("dns error".to_string())
+            } else {
+                Err("timeout".to_string())
+            }
+        });
+        let err = r.unwrap_err();
+        assert!(err.contains("https://primary: dns error"), "got: {err}");
+        assert!(err.contains("https://secondary: timeout"), "got: {err}");
+        assert!(err.starts_with("all rpc endpoints failed: ["), "got: {err}");
+    }
+
+    #[test]
+    fn rpc_retry_third_consecutive_failure_arms_cooldown() {
+        let mut rpc = RpcClient::new(vec!["https://only".to_string()]);
+        for _ in 0..3 {
+            let _: Result<u32, String> = rpc.rpc_call_with_retry(|_| Err("boom".to_string()));
+        }
+        // After 3 failures: cooldown armed (now + 5min), counter reset to 0.
+        assert_eq!(rpc.fail_counts[0], 0);
+        assert!(rpc.cooldown_until[0] > 0, "cooldown should be armed");
+    }
+
+    /// BUG 1 root cause: when EVERY URL is on cooldown the loop body
+    /// would `continue` past every entry and fall through to the empty-
+    /// errors `Err(...)` branch, returning a generic message and silently
+    /// aborting the cycle for up to 5 minutes. The bypass flag forces the
+    /// retry to attempt every URL one more time even while their
+    /// cooldowns are still nominally in effect.
+    #[test]
+    fn rpc_retry_bypasses_when_all_urls_on_cooldown() {
+        let mut rpc = RpcClient::new(vec!["https://a".to_string(), "https://b".to_string()]);
+        // Simulate "both URLs cooled" — the exact state that broke
+        // submit_time on Sentinel.
+        let future = RpcClient::now_secs() + 300;
+        rpc.cooldown_until = vec![future, future];
+
+        let mut tried: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            tried.push(url.to_string());
+            if url == "https://a" {
+                Err::<u32, _>("still down".to_string())
+            } else {
+                Ok(99u32)
+            }
+        });
+
+        assert_eq!(r, Ok(99), "expected bypass to find healthy URL");
+        assert_eq!(
+            tried,
+            vec!["https://a", "https://b"],
+            "both URLs must be tried under bypass"
+        );
+        // Recovered URL: counter AND cooldown cleared.
+        assert_eq!(rpc.cooldown_until[1], 0);
+        assert_eq!(rpc.fail_counts[1], 0);
+    }
+
+    /// Counter-check: when at least one URL is NOT on cooldown the
+    /// bypass does NOT kick in, and the cooled URL is correctly skipped.
+    #[test]
+    fn rpc_retry_skips_cooldown_when_some_url_available() {
+        let mut rpc = RpcClient::new(vec!["https://cold".to_string(), "https://warm".to_string()]);
+        rpc.cooldown_until = vec![RpcClient::now_secs() + 300, 0];
+
+        let mut tried: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            tried.push(url.to_string());
+            Ok::<_, String>(1u32)
+        });
+        assert_eq!(r, Ok(1));
+        // Cold URL skipped, only the warm one is hit.
+        assert_eq!(tried, vec!["https://warm"]);
+        // Cold URL still cooled — bypass did NOT trigger.
+        assert!(rpc.cooldown_until[0] > 0);
+    }
+
+    // ---------- build_cleanup_inactive_transaction (BUG 3 v1.2.1) ----------
+
+    /// Decode just enough of a built TX to inspect its account layout
+    /// and instruction-account index list. Returns
+    /// (ordered_keys, ix_program_id_index, ix_accounts).
+    fn parse_cleanup_tx_layout(tx: &[u8]) -> (Vec<[u8; 32]>, u8, Vec<u8>) {
+        // [compact(num_sigs)] [sigs...] [msg]
+        // For 1 signature: compact(1) = 0x01.
+        assert_eq!(tx[0], 1, "expected exactly 1 signature");
+        let mut p = 1 + 64;
+
+        // Header.
+        let _num_required_signatures = tx[p];
+        p += 1;
+        let _num_readonly_signed = tx[p];
+        p += 1;
+        let _num_readonly_unsigned = tx[p];
+        p += 1;
+
+        // compact(account_keys.len()).
+        let n_keys = tx[p] as usize; // small fleet → fits in 1 byte
+        assert!(
+            n_keys < 0x80,
+            "test only supports 1-byte compact for n_keys"
+        );
+        p += 1;
+
+        let mut ordered_keys: Vec<[u8; 32]> = Vec::with_capacity(n_keys);
+        for _ in 0..n_keys {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&tx[p..p + 32]);
+            ordered_keys.push(k);
+            p += 32;
+        }
+
+        // Skip blockhash.
+        p += 32;
+
+        // compact(num_instructions = 1).
+        assert_eq!(tx[p], 1, "expected exactly 1 instruction");
+        p += 1;
+        let ix_program_id_index = tx[p];
+        p += 1;
+        // compact(ix_accounts.len()).
+        let n_ix_accounts = tx[p] as usize;
+        assert!(
+            n_ix_accounts < 0x80,
+            "test only supports 1-byte compact for n_ix_accounts"
+        );
+        p += 1;
+        let ix_accounts = tx[p..p + n_ix_accounts].to_vec();
+
+        (ordered_keys, ix_program_id_index, ix_accounts)
+    }
+
+    fn fixed_signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    #[test]
+    fn cleanup_tx_includes_payer_in_ix_accounts() {
+        let payer = fixed_signing_key(0xA1);
+        let payer_pubkey = payer.verifying_key().to_bytes();
+        let program_id = [0xC0u8; 32];
+        let oracle_pda = [0x05u8; 32];
+        let blockhash = [0xBBu8; 32];
+        let regs = vec![[0x10u8; 32], [0x20u8; 32]];
+
+        let tx =
+            build_cleanup_inactive_transaction(&payer, &program_id, &oracle_pda, &regs, &blockhash);
+        let (ordered_keys, ix_program_id_index, ix_accounts) = parse_cleanup_tx_layout(&tx);
+
+        // Layout: [payer (writable signed), oracle_pda, regs..., program_id (readonly)]
+        assert_eq!(ordered_keys[0], payer_pubkey);
+        assert_eq!(ordered_keys[1], oracle_pda);
+        assert!(ordered_keys.contains(&regs[0]));
+        assert!(ordered_keys.contains(&regs[1]));
+        assert_eq!(ordered_keys[ix_program_id_index as usize], program_id);
+
+        // BUG 3 fix: ix_accounts must now be [oracle_pda, payer, ...regs].
+        // The prior v1.2.0 layout omitted payer, which makes the new
+        // contract reject the TX (CleanupInactive expects a Signer field).
+        assert_eq!(ix_accounts.len(), 2 + regs.len());
+        let oracle_idx = ordered_keys.iter().position(|k| k == &oracle_pda).unwrap() as u8;
+        let payer_idx = ordered_keys
+            .iter()
+            .position(|k| k == &payer_pubkey)
+            .unwrap() as u8;
+        assert_eq!(
+            ix_accounts[0], oracle_idx,
+            "ix_accounts[0] must point at oracle_state"
+        );
+        assert_eq!(
+            ix_accounts[1], payer_idx,
+            "ix_accounts[1] must point at payer (v1.2.1 layout)"
+        );
+        for reg in &regs {
+            let reg_idx = ordered_keys.iter().position(|k| k == reg).unwrap() as u8;
+            assert!(ix_accounts[2..].contains(&reg_idx));
+        }
+    }
+
+    #[test]
+    fn cleanup_tx_payer_index_is_writable_signer_slot() {
+        // Header invariant: the payer is a writable signer (slot 0) — so
+        // the program may (and does) debit lamports from it for TX fees
+        // and ALSO credit the lamports recovered from `acct.close()`.
+        let payer = fixed_signing_key(0xA2);
+        let tx = build_cleanup_inactive_transaction(
+            &payer,
+            &[0xC0u8; 32],
+            &[0x05u8; 32],
+            &[[0x10u8; 32]],
+            &[0xBBu8; 32],
+        );
+
+        // tx[0..1]: compact(num_sigs)=1; tx[1..65]: signature; tx[65..]: msg
+        // Header: [num_required_sigs, num_readonly_signed, num_readonly_unsigned]
+        let header_offset = 1 + 64;
+        assert_eq!(tx[header_offset], 1, "exactly 1 signer (payer)");
+        assert_eq!(tx[header_offset + 1], 0, "no readonly signers");
+        // 1 readonly_unsigned = program_id; payer is writable_signed at idx 0.
+        assert_eq!(tx[header_offset + 2], 1);
+    }
+
+    #[test]
+    fn cleanup_tx_dedups_payer_against_regs() {
+        // Defensive: even if the caller (somehow) supplies their own
+        // payer pubkey as a registration PDA, the TX builder must dedupe
+        // — Solana's runtime rejects messages with duplicate keys
+        // (AccountLoadedTwice).
+        let payer = fixed_signing_key(0xA3);
+        let payer_pubkey = payer.verifying_key().to_bytes();
+        let program_id = [0xC0u8; 32];
+        let oracle_pda = [0x05u8; 32];
+        let blockhash = [0xBBu8; 32];
+        // Three "registrations", but two of them collide with the payer
+        // and oracle_pda. After dedup only the genuine one remains.
+        let regs = vec![payer_pubkey, oracle_pda, [0x30u8; 32]];
+
+        let tx =
+            build_cleanup_inactive_transaction(&payer, &program_id, &oracle_pda, &regs, &blockhash);
+        let (ordered_keys, _ix_pid, ix_accounts) = parse_cleanup_tx_layout(&tx);
+
+        // No key appears twice.
+        for i in 0..ordered_keys.len() {
+            for j in (i + 1)..ordered_keys.len() {
+                assert_ne!(
+                    ordered_keys[i], ordered_keys[j],
+                    "ordered_keys must be deduplicated"
+                );
+            }
+        }
+        // ix_accounts: [oracle_pda, payer, only_genuine_reg] = 3 entries.
+        assert_eq!(ix_accounts.len(), 3);
+    }
+
+    #[test]
+    fn cleanup_tx_with_no_regs_still_lists_oracle_and_payer() {
+        // Edge case: empty registration_pdas. Builder must still produce
+        // a valid TX whose ix_accounts is exactly [oracle_pda, payer].
+        // This shape is what the contract's `cleanup_inactive` sees when
+        // remaining_accounts is empty (a no-op stale-check that updates
+        // `last_cleanup_slot` but closes nothing).
+        let payer = fixed_signing_key(0xA4);
+        let tx = build_cleanup_inactive_transaction(
+            &payer,
+            &[0xC0u8; 32],
+            &[0x05u8; 32],
+            &[],
+            &[0xBBu8; 32],
+        );
+        let (_ordered_keys, _ix_pid, ix_accounts) = parse_cleanup_tx_layout(&tx);
+        assert_eq!(
+            ix_accounts.len(),
+            2,
+            "ix_accounts must contain [oracle_pda, payer] only"
         );
     }
 }

@@ -618,8 +618,20 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
 
         // n. Send. Drift signals are persisted on success so `x1sr
         // status` can render Chain drift / Sys drift.
+        //
+        // BUG 2 fix (v1.2.1): use the CACHED `sysdrift_ms` snapshot
+        // taken at NTP poll moment, not a fresh `tx_timestamp_ms -
+        // sys_at_consensus_ms`. The latter substitutes to
+        //   sysdrift_ms + (sys_now - sys_at_consensus_ms)
+        // and (sys_now - sys_at_consensus_ms) ≈ PREPOLL_LEAD_SECS
+        // (~30s of intentional pre-poll wait), so the displayed
+        // value would falsely show ~+30 s every cycle even on a
+        // perfectly-synced system clock. The cached `sysdrift_ms`
+        // is the actual drift between consensus NTP and local
+        // system clock at the moment of NTP poll — that is the
+        // semantically correct value to surface in `x1sr status`.
         let drift_for_status = chain_time_ms.map(|c| tx_timestamp_ms - c);
-        let sysdrift_for_status = tx_timestamp_ms - sys_at_consensus_ms;
+        let sysdrift_for_status = sysdrift_ms;
         let send_target_ms = next_boundary_secs.saturating_mul(1000) as i64;
         match rpc.send_transaction(&tx_b64) {
             Ok(sig) => {
