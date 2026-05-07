@@ -507,9 +507,20 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// switching to seconds when the magnitude is at least 1000 ms. None
 /// renders as "(no submission yet)" — the status command's stable
 /// placeholder for fields that depend on the last successful submit.
+///
+/// Defensive guard (BUG 2 v1.2.1): values whose magnitude exceeds
+/// `IMPLAUSIBLE_DRIFT_MS` are also rendered as "(no submission yet)".
+/// Legitimate drift signals are bounded — chain drift by `MAX_SPREAD_MS`
+/// (50ms) and sys drift by the pre-flight `MAX_SYSDRIFT_MS` gate. A
+/// stored value far above either threshold means the field is either
+/// uninitialized, mis-encoded, or carries leftover state from a buggy
+/// version. Showing nonsense ("Sys drift: +30 s" was the original
+/// symptom) is worse than showing "(no submission yet)".
 fn format_drift(ms: Option<i64>) -> String {
+    const IMPLAUSIBLE_DRIFT_MS: i64 = 10_000;
     match ms {
         None => "(no submission yet)".to_string(),
+        Some(m) if m.abs() > IMPLAUSIBLE_DRIFT_MS => "(no submission yet)".to_string(),
         Some(m) if m.abs() >= 1000 => {
             let secs = m / 1000;
             if secs >= 0 {
@@ -549,5 +560,83 @@ fn format_ago(ts: i64) -> String {
         }
     } else {
         format!("{} days ago", diff / 86_400)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- format_drift (BUG 2 v1.2.1 guard) ----------
+
+    #[test]
+    fn format_drift_none_renders_placeholder() {
+        assert_eq!(format_drift(None), "(no submission yet)");
+    }
+
+    #[test]
+    fn format_drift_zero_renders_zero_ms() {
+        assert_eq!(format_drift(Some(0)), "+0 ms");
+    }
+
+    #[test]
+    fn format_drift_small_positive_renders_ms() {
+        assert_eq!(format_drift(Some(42)), "+42 ms");
+    }
+
+    #[test]
+    fn format_drift_small_negative_renders_ms() {
+        assert_eq!(format_drift(Some(-150)), "-150 ms");
+    }
+
+    #[test]
+    fn format_drift_at_seconds_threshold_renders_seconds() {
+        // 1000 ms = exactly 1 s; the >= 1000 branch kicks in.
+        assert_eq!(format_drift(Some(1000)), "+1 s");
+        assert_eq!(format_drift(Some(-1000)), "-1 s");
+        assert_eq!(format_drift(Some(2500)), "+2 s");
+    }
+
+    #[test]
+    fn format_drift_just_below_seconds_threshold_stays_ms() {
+        assert_eq!(format_drift(Some(999)), "+999 ms");
+        assert_eq!(format_drift(Some(-999)), "-999 ms");
+    }
+
+    /// BUG 2 root cause: `last_sysdrift_ms` was computed as
+    /// `tx_timestamp_ms - sys_at_consensus_ms`, which substitutes to
+    /// `sysdrift_ms + PREPOLL_LEAD_SECS*1000` — i.e., ~+30 000 ms every
+    /// cycle even on a perfectly-synced clock. The cached-value fix in
+    /// `main.rs` is the primary remedy; this guard is defense-in-depth
+    /// against any future code path that stores an implausibly large
+    /// drift in `DaemonStatus`.
+    #[test]
+    fn format_drift_implausible_positive_renders_placeholder() {
+        // The exact symptom from Sentinel: "+30 s" was displayed.
+        assert_eq!(format_drift(Some(30_000)), "(no submission yet)");
+        // Just above the 10 s gate.
+        assert_eq!(format_drift(Some(10_001)), "(no submission yet)");
+        // Far above the gate.
+        assert_eq!(format_drift(Some(999_999)), "(no submission yet)");
+    }
+
+    #[test]
+    fn format_drift_implausible_negative_renders_placeholder() {
+        assert_eq!(format_drift(Some(-30_000)), "(no submission yet)");
+        assert_eq!(format_drift(Some(-10_001)), "(no submission yet)");
+    }
+
+    /// Boundary check: 10 000 ms is the highest value still treated as
+    /// real (renders as "+10 s"). 10 001 ms tips into the implausible
+    /// branch. The threshold is meant to be loose — legitimate gates
+    /// keep real drift values an order of magnitude below this.
+    #[test]
+    fn format_drift_boundary_10s_still_renders() {
+        assert_eq!(format_drift(Some(10_000)), "+10 s");
+        assert_eq!(format_drift(Some(-10_000)), "-10 s");
     }
 }

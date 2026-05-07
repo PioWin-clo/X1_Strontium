@@ -168,16 +168,28 @@ impl RpcClient {
     where
         F: FnMut(&str) -> Result<T, String>,
     {
-        let mut last_err = String::from("no rpc endpoints configured");
+        if self.urls.is_empty() {
+            return Err("no rpc endpoints configured".to_string());
+        }
         let now = Self::now_secs();
-        // Track the first endpoint that failed in this call so a
-        // successful fallback can log it (debug-only, gated by
-        // X1SR_DEBUG env var to avoid noisy production logs). The error
-        // log fires only when ALL endpoints fail (the final Err return).
+
+        // Bypass cooldowns when EVERY URL is on cooldown — otherwise the
+        // daemon would deadlock for 5 minutes on "no rpc endpoints
+        // configured" even though some endpoint might be reachable
+        // again. This was the root cause of the v1.2.0 submit_time DNS
+        // fallback bug: once a noisy cycle pushed both endpoints past
+        // the 3-fail threshold, every subsequent call returned the
+        // generic error and silently aborted the cycle.
+        let bypass_cooldown = (0..self.urls.len()).all(|i| self.cooldown_until[i] > now);
+
+        // Per-URL error log so the final Err message names the actual
+        // endpoint(s) that failed, not just the last one tried. Helps
+        // operators diagnose DNS-vs-RPC-vs-firewall issues from logs.
+        let mut errors: Vec<String> = Vec::with_capacity(self.urls.len());
         let mut first_failed: Option<String> = None;
 
         for i in 0..self.urls.len() {
-            if self.cooldown_until[i] > now {
+            if !bypass_cooldown && self.cooldown_until[i] > now {
                 continue;
             }
             match op(&self.urls[i]) {
@@ -190,14 +202,18 @@ impl RpcClient {
                             );
                         }
                     }
+                    // Healthy endpoint: clear both counter AND any
+                    // outstanding cooldown so the recovery isn't
+                    // shadowed by a stale block.
                     self.fail_counts[i] = 0;
+                    self.cooldown_until[i] = 0;
                     return Ok(v);
                 }
                 Err(e) => {
                     if first_failed.is_none() {
                         first_failed = Some(self.urls[i].clone());
                     }
-                    last_err = e;
+                    errors.push(format!("{}: {e}", self.urls[i]));
                     self.fail_counts[i] += 1;
                     if self.fail_counts[i] >= 3 {
                         self.cooldown_until[i] = now + 5 * 60;
@@ -206,7 +222,7 @@ impl RpcClient {
                 }
             }
         }
-        Err(last_err)
+        Err(format!("all rpc endpoints failed: [{}]", errors.join("; ")))
     }
 
     pub fn get_recent_blockhash(&mut self) -> Result<[u8; 32], String> {
@@ -1612,5 +1628,140 @@ mod tests {
             "expected ~100x runway, got ratio {}",
             big / solo
         );
+    }
+
+    // ---------- RpcClient::rpc_call_with_retry (BUG 1 v1.2.1) ----------
+
+    #[test]
+    fn rpc_retry_empty_urls_returns_specific_error() {
+        let mut rpc = RpcClient::new(vec![]);
+        let r: Result<(), String> = rpc.rpc_call_with_retry(|_| Ok(()));
+        assert_eq!(r, Err("no rpc endpoints configured".to_string()));
+    }
+
+    #[test]
+    fn rpc_retry_succeeds_on_first_url_when_healthy() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let mut calls: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            calls.push(url.to_string());
+            Ok::<_, String>(42u32)
+        });
+        assert_eq!(r, Ok(42));
+        assert_eq!(calls, vec!["https://primary"]);
+        assert_eq!(rpc.fail_counts, vec![0, 0]);
+        assert_eq!(rpc.cooldown_until, vec![0, 0]);
+    }
+
+    #[test]
+    fn rpc_retry_falls_back_to_secondary_when_primary_fails() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let mut calls: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            calls.push(url.to_string());
+            if url == "https://primary" {
+                Err::<u32, _>("dns error".to_string())
+            } else {
+                Ok(7u32)
+            }
+        });
+        assert_eq!(r, Ok(7));
+        assert_eq!(calls, vec!["https://primary", "https://secondary"]);
+        // Primary failed once → fail_count=1, no cooldown yet (threshold=3).
+        assert_eq!(rpc.fail_counts[0], 1);
+        assert_eq!(rpc.cooldown_until[0], 0);
+        // Secondary succeeded → counter and cooldown both cleared.
+        assert_eq!(rpc.fail_counts[1], 0);
+        assert_eq!(rpc.cooldown_until[1], 0);
+    }
+
+    #[test]
+    fn rpc_retry_all_fail_returns_per_url_diagnostics() {
+        let mut rpc = RpcClient::new(vec![
+            "https://primary".to_string(),
+            "https://secondary".to_string(),
+        ]);
+        let r: Result<u32, String> = rpc.rpc_call_with_retry(|url| {
+            if url == "https://primary" {
+                Err("dns error".to_string())
+            } else {
+                Err("timeout".to_string())
+            }
+        });
+        let err = r.unwrap_err();
+        assert!(err.contains("https://primary: dns error"), "got: {err}");
+        assert!(err.contains("https://secondary: timeout"), "got: {err}");
+        assert!(err.starts_with("all rpc endpoints failed: ["), "got: {err}");
+    }
+
+    #[test]
+    fn rpc_retry_third_consecutive_failure_arms_cooldown() {
+        let mut rpc = RpcClient::new(vec!["https://only".to_string()]);
+        for _ in 0..3 {
+            let _: Result<u32, String> = rpc.rpc_call_with_retry(|_| Err("boom".to_string()));
+        }
+        // After 3 failures: cooldown armed (now + 5min), counter reset to 0.
+        assert_eq!(rpc.fail_counts[0], 0);
+        assert!(rpc.cooldown_until[0] > 0, "cooldown should be armed");
+    }
+
+    /// BUG 1 root cause: when EVERY URL is on cooldown the loop body
+    /// would `continue` past every entry and fall through to the empty-
+    /// errors `Err(...)` branch, returning a generic message and silently
+    /// aborting the cycle for up to 5 minutes. The bypass flag forces the
+    /// retry to attempt every URL one more time even while their
+    /// cooldowns are still nominally in effect.
+    #[test]
+    fn rpc_retry_bypasses_when_all_urls_on_cooldown() {
+        let mut rpc = RpcClient::new(vec!["https://a".to_string(), "https://b".to_string()]);
+        // Simulate "both URLs cooled" — the exact state that broke
+        // submit_time on Sentinel.
+        let future = RpcClient::now_secs() + 300;
+        rpc.cooldown_until = vec![future, future];
+
+        let mut tried: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            tried.push(url.to_string());
+            if url == "https://a" {
+                Err::<u32, _>("still down".to_string())
+            } else {
+                Ok(99u32)
+            }
+        });
+
+        assert_eq!(r, Ok(99), "expected bypass to find healthy URL");
+        assert_eq!(
+            tried,
+            vec!["https://a", "https://b"],
+            "both URLs must be tried under bypass"
+        );
+        // Recovered URL: counter AND cooldown cleared.
+        assert_eq!(rpc.cooldown_until[1], 0);
+        assert_eq!(rpc.fail_counts[1], 0);
+    }
+
+    /// Counter-check: when at least one URL is NOT on cooldown the
+    /// bypass does NOT kick in, and the cooled URL is correctly skipped.
+    #[test]
+    fn rpc_retry_skips_cooldown_when_some_url_available() {
+        let mut rpc = RpcClient::new(vec!["https://cold".to_string(), "https://warm".to_string()]);
+        rpc.cooldown_until = vec![RpcClient::now_secs() + 300, 0];
+
+        let mut tried: Vec<String> = Vec::new();
+        let r = rpc.rpc_call_with_retry(|url| {
+            tried.push(url.to_string());
+            Ok::<_, String>(1u32)
+        });
+        assert_eq!(r, Ok(1));
+        // Cold URL skipped, only the warm one is hit.
+        assert_eq!(tried, vec!["https://warm"]);
+        // Cold URL still cooled — bypass did NOT trigger.
+        assert!(rpc.cooldown_until[0] > 0);
     }
 }
