@@ -2,7 +2,7 @@
 
 Decentralized atomic time oracle for the X1 blockchain.
 
-[![CI](https://github.com/PioWin-clo/x1-strontium/actions/workflows/ci.yml/badge.svg)](https://github.com/PioWin-clo/x1-strontium/actions/workflows/ci.yml)
+[![Release](https://github.com/PioWin-clo/X1_Strontium/actions/workflows/release.yml/badge.svg)](https://github.com/PioWin-clo/X1_Strontium/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > Polish version: [README.pl.md](README.pl.md)
@@ -14,7 +14,7 @@ X1 mainnet. Any X1 program can then call `read_time` over CPI to get a
 trustworthy clock — without depending on the unreliable on-chain
 `Clock::unix_timestamp`.
 
-**v1.1** is an in-place upgrade that replaces the operator-onboarding
+**v1.1.1** is an in-place upgrade that replaces the operator-onboarding
 flow with a simpler file-based model. The Program ID is preserved
 (deployed via `solana program deploy --program-id <existing>`) but the
 OracleState PDA gains a fourth seed segment so the v1.0 PDA at
@@ -45,7 +45,7 @@ the missing certified time reference.
 
 ---
 
-## Quick facts (mainnet v1.1)
+## Quick facts (mainnet v1.1.1)
 
 | Field                  | Value                                                  |
 |------------------------|--------------------------------------------------------|
@@ -65,9 +65,7 @@ the missing certified time reference.
 | Maximum operators      | 512                                                    |
 
 Retired (closed on chain) v0.5 Program ID for reference only:
-`2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`. The v1.0 OracleState PDA
-at `EQ9CgHkx34AL7gaBHSX9nEWbwBtEfktbVGyQWEsTEtEy` is orphan post-v1.1
-upgrade — its 0.07 XNT of rent stays locked there forever.
+`2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`.
 
 **Bootstrap mode (v1.1.1+).** Strontium reports `is_degraded = 1`
 regardless of per-window quorum and confidence whenever the active
@@ -205,10 +203,10 @@ X1Strontium:v1:w=5921961:nts=08:45:00.003:sys=08:45:00.005:chain=08:45:00.000:dr
 |--------------|---------------------------------------------------------------|
 | `w=`         | Rotation window id                                            |
 | `<tier>=`    | Consensus time (HH:MM:SS.mmm); prefix is `gps`/`nts`/`s1`/`ntp` |
-| `sys=`       | Daemon's system clock at the consensus moment (NEW in v1.1)   |
+| `sys=`       | Daemon's system clock at the consensus moment                 |
 | `chain=`     | On-chain `Clock::unix_timestamp` at submission (or `??`)      |
 | `drift=`     | Signed ms delta between our estimate and `chain=` (or `null`) |
-| `sysdrift=`  | Signed ms delta between our estimate and `sys=` (NEW in v1.1) |
+| `sysdrift=`  | Signed ms delta between our estimate and `sys=`               |
 | `c=`         | Confidence percent (60–99)                                    |
 | `s=`         | Number of sources used                                        |
 | `st=`        | Best stratum among contributing sources                       |

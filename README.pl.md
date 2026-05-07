@@ -2,7 +2,7 @@
 
 Zdecentralizowany atomowy oracle czasu dla blockchaina X1.
 
-[![CI](https://github.com/PioWin-clo/x1-strontium/actions/workflows/ci.yml/badge.svg)](https://github.com/PioWin-clo/x1-strontium/actions/workflows/ci.yml)
+[![Release](https://github.com/PioWin-clo/X1_Strontium/actions/workflows/release.yml/badge.svg)](https://github.com/PioWin-clo/X1_Strontium/actions/workflows/release.yml)
 [![Licencja](https://img.shields.io/badge/licencja-MIT-blue.svg)](LICENSE)
 
 > Wersja angielska: [README.md](README.md)
@@ -14,7 +14,7 @@ sieci głównej X1. Każdy program X1 może następnie wywołać `read_time`
 przez CPI, aby uzyskać wiarygodny zegar — bez polegania na zawodnym
 on-chainowym `Clock::unix_timestamp`.
 
-**v1.1** to upgrade in-place, który zastępuje proces onboardingu
+**v1.1.1** to upgrade in-place, który zastępuje proces onboardingu
 operatorów prostszym modelem opartym o pliki kluczy. Program ID jest
 zachowany (deploy przez `solana program deploy --program-id <existing>`),
 ale OracleState PDA dostaje czwarty segment seedów, więc PDA z v1.0
@@ -45,7 +45,7 @@ brakującego certyfikowanego źródła czasu.
 
 ---
 
-## Szybkie fakty (mainnet v1.1)
+## Szybkie fakty (mainnet v1.1.1)
 
 | Pole                    | Wartość                                                |
 |-------------------------|--------------------------------------------------------|
@@ -65,10 +65,7 @@ brakującego certyfikowanego źródła czasu.
 | Maks. liczba operatorów | 512                                                    |
 
 Wycofany (zamknięty on-chain) Program ID v0.5 wyłącznie do odniesienia:
-`2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`. OracleState PDA z v1.0
-pod adresem `EQ9CgHkx34AL7gaBHSX9nEWbwBtEfktbVGyQWEsTEtEy` jest
-osierocony po upgrade'ie do v1.1 — jego 0,07 XNT renty zostaje
-zablokowane tam na zawsze.
+`2FgHeEQfY1C774uyo8RDKHcjTRz2mVPJ6wotrD9P3YgJ`.
 
 **Tryb bootstrap (v1.1.1+).** Strontium raportuje `is_degraded = 1`
 niezależnie od per-okna quorum i confidence dopóki aktywna pula
@@ -206,10 +203,10 @@ X1Strontium:v1:w=5921961:nts=08:45:00.003:sys=08:45:00.005:chain=08:45:00.000:dr
 |--------------|------------------------------------------------------------|
 | `w=`         | Numer okna rotacji                                         |
 | `<tier>=`    | Czas konsensusu (HH:MM:SS.mmm); prefix to `gps`/`nts`/`s1`/`ntp` |
-| `sys=`       | Zegar systemowy daemona w momencie konsensusu (NOWE w v1.1)|
+| `sys=`       | Zegar systemowy daemona w momencie konsensusu              |
 | `chain=`     | `Clock::unix_timestamp` w momencie wysyłki (lub `??`)      |
 | `drift=`     | Różnica w ms między naszym estymatorem a `chain=` (lub `null`) |
-| `sysdrift=`  | Różnica w ms między naszym estymatorem a `sys=` (NOWE w v1.1) |
+| `sysdrift=`  | Różnica w ms między naszym estymatorem a `sys=`               |
 | `c=`         | Confidence (procent, 60–99)                                |
 | `s=`         | Liczba użytych źródeł                                      |
 | `st=`        | Najlepszy stratum wśród źródeł                             |
