@@ -8,7 +8,7 @@ Zdecentralizowany atomowy oracle czasu dla blockchaina X1.
 > Wersja angielska: [README.md](README.md)
 
 X1 Strontium agreguje pomiary z 45 źródeł NTP rozmieszczonych na sześciu
-kontynentach (33 serwerów Stratum-1 / NTS oraz 12 zapasowych z poolu) i
+kontynentach (33 serwery Stratum-1 / NTS oraz 12 zapasowych z poolu) i
 zapisuje konsensusowe znaczniki czasu UTC do smart contractu Anchora w
 sieci głównej X1. Każdy program X1 może następnie wywołać `read_time`
 przez CPI, aby uzyskać wiarygodny zegar — bez polegania na zawodnym
