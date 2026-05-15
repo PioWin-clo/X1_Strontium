@@ -14,14 +14,15 @@ X1 mainnet. Any X1 program can then call `read_time` over CPI to get a
 trustworthy clock — without depending on the unreliable on-chain
 `Clock::unix_timestamp`.
 
-**v1.2.0** is an in-place upgrade that replaces the operator-onboarding
-flow with a simpler file-based model. The Program ID is preserved
-(deployed via `solana program deploy --program-id <existing>`) but the
-OracleState PDA gains a fourth seed segment so the v1.0 PDA at
-`EQ9CgHkx…` is left orphan on chain. Registration is now a single
-2-signer transaction the daemon builds itself; the operator's hardware
-wallet only ever signs the initial XNT transfer that funds the
-`oracle.json` keypair.
+**v1.3** is an in-place upgrade on top of the v1.2.0 file-based
+operator-onboarding flow. Cleanup tolerance switches from a per-fleet-
+size missed-turn count to a fixed 24-hour wall-clock grace; the daemon
+re-registers automatically at startup when its PDA was closed by a
+prior `cleanup_inactive`; the memo's `sysdrift=` field now reflects the
+true drift at the NTP poll moment (v1.2.x had a phantom ~30 s offset);
+and two new Stratum-1 NTP sources land (`hora.roa.es`,
+`time2.kriss.re.kr`). The Program ID is preserved; the on-chain
+`OracleState` layout is unchanged.
 
 ---
 
@@ -45,7 +46,7 @@ the missing certified time reference.
 
 ---
 
-## Quick facts (mainnet v1.2.0)
+## Quick facts (mainnet v1.3)
 
 | Field                  | Value                                                  |
 |------------------------|--------------------------------------------------------|
@@ -60,7 +61,7 @@ the missing certified time reference.
 | Quorum                 | 10 % of registered operators, min 1, max 6             |
 | Minimum self-stake     | withdrawer-match: stake withdraw authority must equal vote account authorized_withdrawer (off-chain gate) |
 | Minimum validator age  | 64 epochs of voting history (off-chain gate)           |
-| Auto-cleanup threshold | 10 of an operator's own rotation turns missed in a row |
+| Auto-cleanup threshold | 1440 contract-windows of silence (~24 h, fleet-size independent — v1.3) |
 | On-chain account size  | 9744 B (488 B headroom under X1's 10 240 B CPI cap)    |
 | Maximum operators      | 512                                                    |
 
@@ -244,30 +245,56 @@ acceptable results.
   gate). The contract holds no parsers; the gates live in the
   open-source daemon code that anyone can audit.
 
-- **Auto-cleanup of inactive operators** — the contract removes
-  operators who miss 10 consecutive of their own rotation turns. The
-  threshold scales naturally with fleet size (~100 min for n=2, ~14 h
-  for n=100). Permissionless: any caller can fire the
-  `cleanup_inactive` instruction with a batch of registrations in
-  `remaining_accounts`. No admin removal, no governance vote.
+- **Auto-cleanup of inactive operators** — operators that don't submit
+  `submit_time` for ~24 hours are removed from the active set by
+  `cleanup_inactive`, regardless of fleet size. One day of grace covers
+  reboots, maintenance windows, and transient network outages without
+  manual intervention. (v1.3+ behaviour; v1.2.x used per-turn missed-
+  count math that gave only ~22 min tolerance at n=2 and ~14 h at
+  n=100 — fixed in the v1.3 changelog.) Permissionless: any caller can
+  fire the `cleanup_inactive` instruction with a batch of registrations
+  in `remaining_accounts`, and the rent recovered from each closed PDA
+  flows back to the cleanup-TX payer. No admin removal, no governance
+  vote.
 
 - **One registration per oracle keypair** — rotation = generate a fresh
   `oracle.json`, fund it, and re-register. The old registration auto-
-  cleans after 10 missed turns. No on-chain "rotate" instruction; no
-  hardware-wallet ceremony for routine key rotation.
+  cleans after 24 h of silence. v1.3+ auto-recovers at startup: if the
+  daemon finds its PDA missing or inactive, it rebuilds and sends the
+  2-signer `register_submitter` TX itself (gated by oracle balance,
+  vote keypair availability, and the same anti-farm self-stake check
+  as the manual `register` subcommand). No on-chain "rotate"
+  instruction; no hardware-wallet ceremony for routine key rotation.
 
 ---
 
 ## Roadmap
 
-- **v1.2.0** (this release) — runway calculation corrected for fleet
-  size n, install fix (unit file always written), silent RPC fallback,
-  chain drift + sysdrift in status output, pre-computation NTP polling
-  (sub-200ms TX timing), withdrawer-match stake gate.
+- **v1.3** (this release) — 24 h wall-clock cleanup grace
+  (`CLEANUP_GRACE_WINDOWS = 1440`, fleet-size independent), startup
+  auto-recover when the registration PDA is missing or flagged inactive
+  (gated by 0.6 XNT min balance + withdrawer-match self-stake), memo's
+  `sysdrift=` field reads the cached drift snapshot from the NTP poll
+  moment (fixes phantom ~30 s offset under the pre-poll architecture),
+  two new Stratum-1 NTP sources (`hora.roa.es`, `time2.kriss.re.kr`),
+  System76 endpoints relabeled Stratum 2 to match actual responses.
 
-- **v1.3** — true NTS-KE authentication on the NTS-capable endpoints.
-  Today the daemon polls those servers via plain NTP; the tier label
-  `nts` is informational only until session-key handshake lands.
+- **v1.2.1** (previous) — DNS-fallback fix in `RpcClient` (bypass
+  cooldowns when every URL is cold), defensive guard on the `x1sr
+  status` drift renderer, `cleanup_inactive` closes the PDA instead of
+  just flipping `is_active = false` (so the same `oracle_keypair` can
+  re-register cleanly).
+
+- **v1.2.0** (initial v1.2 line) — runway calculation corrected for
+  fleet size n, install fix (unit file always written), silent RPC
+  fallback, chain drift + sysdrift in status output, pre-computation
+  NTP polling (sub-200ms TX timing), withdrawer-match stake gate.
+
+- **v1.4 (proposed)** — true NTS-KE authentication on the NTS-capable
+  endpoints. Today the daemon polls those servers via plain NTP; the
+  tier label `nts` is informational only until session-key handshake
+  lands. Likely also: re-probe USNO×2 + INRIM + named-region fallbacks
+  from the Sentinel production network, add whichever respond.
 
 - **v∞ — contract lock.** Once multiple operators beyond Prime +
   Sentinel have joined and the Tachyon validator update has rolled

@@ -1,6 +1,6 @@
 [package]
 name = "x1-strontium"
-version = "1.2.1"
+version = "1.3.0"
 description = "X1 Strontium — decentralized atomic time oracle"
 edition = "2021"
 
