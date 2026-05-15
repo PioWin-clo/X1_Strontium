@@ -126,11 +126,6 @@ jobs:
             sudo ln -sf /usr/local/bin/x1-strontium /usr/local/bin/x1sr
             x1sr --help
             ```
-
-            ### On-chain deployment (mainnet)
-            - Program ID: `2thzsm9z31MPEvDWHuuSGqAcjrr5ek4pS78EgPAT4Fch`
-            - Oracle State PDA: `cfm1Tc7CNdTa8Hm8FGWAuHXaaozSjQHNmdBD5mEVN9P`
-            - Last deploy slot: 46716147
           files: |
             x1-strontium-linux-x86_64
             x1-strontium.sha256
