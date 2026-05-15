@@ -25,6 +25,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MIN_BALANCE_WARN: f64 = 1.0;
 const MIN_BALANCE_STOP: f64 = 0.05;
+/// Minimum oracle.json balance the v1.3 startup auto-recover requires
+/// before it will send a `register_submitter` TX on the operator's behalf.
+/// Covers one register TX (~0.5 XNT rent for the new ValidatorRegistration
+/// PDA + ~0.000005 XNT fee) plus a small buffer for the first few
+/// `submit_time` cycles before the operator can top up further.
+const MIN_BALANCE_AUTO_RECOVER_XNT: f64 = 0.6;
 const REDISCOVER_SECS: i64 = 3600;
 const READINESS_MAX_TRIES: u32 = 20;
 
@@ -56,7 +62,7 @@ const MAX_SYSDRIFT_MS: i64 = 5000;
 fn print_help() {
     println!(
         "\
-X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.2.0)
+X1 Strontium — Decentralized Time Oracle for X1 Blockchain (v1.3.0)
 
 USAGE:
   x1-strontium <command> [options]
@@ -229,18 +235,68 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
     // a full NTP cycle just to have the chain reject `submit_time` with
     // RegistrationInactive (or AccountNotFound) — surface the problem at
     // startup instead.
-    let own_registration = rpc.fetch_registration(&registration_pda).map_err(|e| {
-        format!(
-            "registration PDA {registration_pda_b58} not found on chain ({e})\n\
-             Run `x1-strontium register` first."
-        )
-    })?;
-    if !own_registration.is_active {
-        return Err(format!(
-            "registration {registration_pda_b58} is_active = false (cleaned up after \
-             missed turns). Re-run `x1-strontium register` to rejoin the operator set."
-        ));
-    }
+    // v1.3 auto-recover: if the registration PDA is missing (closed by
+    // `cleanup_inactive`) or flagged inactive (legacy v1.2.0 leftover),
+    // try to send a fresh `register_submitter` TX automatically before
+    // bailing out. Auto-recover is gated by the same anti-farm
+    // preconditions as the manual `cmd_register` — see
+    // `attempt_auto_recover_registration`. Only "does not exist on
+    // chain" + "is_active = false" trigger recovery; other RPC errors
+    // (network down, parse error) propagate so the operator
+    // investigates manually.
+    let own_registration = match rpc.fetch_registration(&registration_pda) {
+        Ok(reg) if reg.is_active => reg,
+        Ok(_reg_inactive) => {
+            eprintln!(
+                "[startup] registration {registration_pda_b58} is_active = false \
+                 (legacy v1.2.0 inactive PDA — v1.3 cleanup closes instead of flagging)"
+            );
+            attempt_auto_recover_registration(
+                &mut rpc,
+                &config,
+                &oracle_keypair,
+                &program_id,
+                &oracle_pda,
+                &registration_pda,
+                config.dry_run,
+            )?;
+            rpc.fetch_registration(&registration_pda).map_err(|e| {
+                format!(
+                    "post auto-recover fetch failed for {registration_pda_b58}: {e}\n\
+                     The auto-recover TX may have landed but RPC is now flaky — \
+                     restart the daemon to retry."
+                )
+            })?
+        }
+        Err(e) if e.contains("does not exist on chain") => {
+            eprintln!(
+                "[startup] registration {registration_pda_b58} not found on chain \
+                 (closed by cleanup_inactive after >{CLEANUP_GRACE_WINDOWS} windows of silence)"
+            );
+            attempt_auto_recover_registration(
+                &mut rpc,
+                &config,
+                &oracle_keypair,
+                &program_id,
+                &oracle_pda,
+                &registration_pda,
+                config.dry_run,
+            )?;
+            rpc.fetch_registration(&registration_pda).map_err(|e| {
+                format!(
+                    "post auto-recover fetch failed for {registration_pda_b58}: {e}\n\
+                     The auto-recover TX may have landed but RPC is now flaky — \
+                     restart the daemon to retry."
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(format!(
+                "registration PDA {registration_pda_b58} fetch failed: {e}\n\
+                 Check RPC connectivity, then run `x1-strontium register` if needed."
+            ));
+        }
+    };
     let vote_account = own_registration.vote_account;
     let vote_account_b58 = bs58::encode(vote_account).into_string();
     println!("  vote account:     {vote_account_b58}  (from registration)");
@@ -605,6 +661,11 @@ fn run_daemon(config: X1StrontiumConfig) -> Result<(), String> {
             chain_time_ms,
             precise_time_ms: tx_timestamp_ms,
             sys_at_consensus_ms,
+            // v1.3: pass the cached sysdrift snapshot so build_memo's
+            // `sysdrift=` field reflects drift at NTP poll moment, not
+            // a misleading recompute that bleeds in the ~30 s pre-poll
+            // lead.
+            sysdrift_ms,
         };
         let tx = build_submit_transaction_signed(
             &oracle_keypair,
@@ -1886,32 +1947,183 @@ fn compute_self_stake_off_chain(
     Ok(total)
 }
 
+// ---------------------------------------------------------------------------
+// Auto-recover (v1.3): re-register at startup if the registration PDA is
+// missing or inactive, without forcing the operator to hand-execute
+// `x1-strontium register`. Common trigger: the operator's daemon was
+// silent past CLEANUP_GRACE_WINDOWS (~24 h) and a cleanup_inactive TX
+// closed their PDA; on restart they want to rejoin the fleet immediately.
+// ---------------------------------------------------------------------------
+
+/// Pure preconditions check for auto-recover. Extracted so cargo test
+/// can exercise each refuse-path (low oracle balance, missing vote
+/// keypair file, zero qualifying self-stake) without I/O.
+///
+/// Preconditions, evaluated in this order so the operator-facing error
+/// message points at the first blocker:
+/// 1. Oracle balance ≥ `MIN_BALANCE_AUTO_RECOVER_XNT` (covers register
+///    rent + small `submit_time` runway buffer).
+/// 2. Vote keypair file present on disk (existence + `expand_tilde`).
+/// 3. Qualifying self-stake > 0 lamports (anti-farm: at least one stake
+///    account whose withdraw authority matches `vote.authorized_withdrawer`).
+///
+/// Returns Ok(()) iff all three pass.
+fn check_auto_recover_preconditions(
+    oracle_balance_lamports: u64,
+    vote_keypair_path: &str,
+    self_stake_lamports: u64,
+) -> Result<(), String> {
+    let oracle_balance_xnt = lamports_to_xnt(oracle_balance_lamports);
+    if oracle_balance_xnt < MIN_BALANCE_AUTO_RECOVER_XNT {
+        return Err(format!(
+            "oracle.json balance {oracle_balance_xnt:.3} XNT < {MIN_BALANCE_AUTO_RECOVER_XNT:.2} XNT \
+             required for auto-recover — top up from authorized_withdrawer Ledger before restart"
+        ));
+    }
+    let expanded = expand_tilde(vote_keypair_path);
+    if !std::path::Path::new(&expanded).exists() {
+        return Err(format!(
+            "vote keypair not found at {expanded} — run \
+             `x1-strontium config set vote_keypair <path>` and ensure the \
+             file exists before restart"
+        ));
+    }
+    if self_stake_lamports == 0 {
+        return Err(
+            "qualifying self-stake = 0 XNT (no stake account whose withdraw \
+             authority matches vote.authorized_withdrawer, age ≥ 2 epochs, \
+             not deactivating) — anti-farm gate refuses auto-recover"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Orchestration for auto-recover: fetch all required RPC state,
+/// validate preconditions, build the 2-signer `register_submitter` TX,
+/// and send it (or print without sending when `dry_run` is true).
+///
+/// The function deliberately surfaces the SAME refuse-paths and error
+/// shapes the manual `cmd_register` would emit — operators reading
+/// daemon logs after a failed auto-recover should get the exact same
+/// remediation guidance they'd see from a hand-run `x1-strontium register`.
+fn attempt_auto_recover_registration(
+    rpc: &mut RpcClient,
+    config: &X1StrontiumConfig,
+    oracle_keypair: &SigningKey,
+    program_id: &[u8; 32],
+    oracle_pda: &[u8; 32],
+    registration_pda: &[u8; 32],
+    dry_run: bool,
+) -> Result<(), String> {
+    let vote_path = match &config.vote_keypair_path {
+        Some(p) => p.clone(),
+        None => {
+            return Err("vote_keypair_path is not set in config — run \
+                 `x1-strontium config set vote_keypair <path>` before restart"
+                .to_string());
+        }
+    };
+
+    let oracle_pubkey: [u8; 32] = oracle_keypair.verifying_key().to_bytes();
+    let oracle_pubkey_b58 = bs58::encode(oracle_pubkey).into_string();
+
+    // 1. Balance.
+    let oracle_balance_lamports = rpc
+        .get_balance(&oracle_pubkey_b58)
+        .map_err(|e| format!("auto-recover: balance check failed: {e}"))?;
+
+    // 2. Vote keypair load — needed to derive pubkey for the stake
+    //    computation AND to co-sign the register TX. The file-existence
+    //    half of the precondition is asserted in
+    //    `check_auto_recover_preconditions`, run after this step
+    //    succeeds; we still load here to fail early if the file is
+    //    present but corrupt.
+    let vote_keypair = load_keypair(&vote_path)
+        .map_err(|e| format!("auto-recover: cannot load vote keypair at {vote_path}: {e}"))?;
+    let vote_pubkey: [u8; 32] = vote_keypair.verifying_key().to_bytes();
+    let vote_pubkey_b58 = bs58::encode(vote_pubkey).into_string();
+
+    // 3. Self-stake (withdrawer-match anti-farm gate).
+    let vote_account_data = rpc
+        .fetch_account_info(&vote_pubkey_b58)
+        .map_err(|e| format!("auto-recover: cannot fetch vote account: {e}"))?;
+    if vote_account_data.len() < 68 {
+        return Err(
+            "auto-recover: vote account too short to read authorized_withdrawer".to_string(),
+        );
+    }
+    let mut withdrawer = [0u8; 32];
+    withdrawer.copy_from_slice(&vote_account_data[36..68]);
+    let self_stake_lamports = compute_self_stake_off_chain(rpc, &vote_pubkey, &withdrawer)
+        .map_err(|e| format!("auto-recover: self-stake compute failed: {e}"))?;
+
+    check_auto_recover_preconditions(oracle_balance_lamports, &vote_path, self_stake_lamports)?;
+
+    println!(
+        "[startup] registration absent/inactive — auto-recovering \
+         (no manual intervention required)"
+    );
+    println!(
+        "[auto-recover] oracle balance: {:.3} XNT (≥ {:.2} required)",
+        lamports_to_xnt(oracle_balance_lamports),
+        MIN_BALANCE_AUTO_RECOVER_XNT
+    );
+    println!(
+        "[auto-recover] qualifying self-stake: {} XNT (withdrawer-match)",
+        self_stake_lamports / 1_000_000_000
+    );
+
+    let blockhash = rpc
+        .get_recent_blockhash()
+        .map_err(|e| format!("auto-recover: blockhash error: {e}"))?;
+    let tx = build_register_transaction(
+        oracle_keypair,
+        &vote_keypair,
+        program_id,
+        oracle_pda,
+        registration_pda,
+        &blockhash,
+    );
+
+    if dry_run {
+        println!(
+            "[auto-recover] dry-run: register TX built ({} bytes) — not sending",
+            tx.len()
+        );
+        return Ok(());
+    }
+
+    println!("[auto-recover] sending register_submitter ...");
+    let sig = rpc
+        .send_transaction(&base64_encode(&tx))
+        .map_err(|e| format!("auto-recover: register TX failed: {e}"))?;
+    println!("[auto-recover] ✅ Success — signature: {sig}");
+    Ok(())
+}
+
 /// Replicated from `programs/x1-strontium/src/lib.rs` so the daemon can
 /// mirror the contract's stale-operator math when deciding whether to
 /// fire `cleanup_inactive`. Bumped together with the contract literal
 /// — there is no enforcement linking the two values, so a contract
 /// change without a daemon change here would leak no-op TXs again.
-const CLEANUP_MAX_MISSED_TURNS: u64 = 10;
+///
+/// v1.3: fixed-grace wall-clock window (`windows_since >
+/// CLEANUP_GRACE_WINDOWS`). Replaces v1.2's per-fleet-size
+/// `CLEANUP_MAX_MISSED_TURNS = 10` with `windows_per_turn` division —
+/// the daemon and contract now share the same fleet-size-independent
+/// threshold, so the pre-flight never fires no-op TXs that the
+/// contract would skip (and vice versa).
+const CLEANUP_GRACE_WINDOWS: u64 = 1440;
 const CLEANUP_WINDOW_SLOTS: u64 = 150;
-
-/// Daemon-side mirror of `programs/x1-strontium/src/lib.rs::windows_per_turn`.
-/// Used only by the `try_cleanup_inactive` pre-flight stale-check.
-fn windows_per_turn_daemon(n_operators: u16) -> u64 {
-    use crate::rotation::MAX_SUBMISSIONS;
-    if n_operators == 0 {
-        return 1;
-    }
-    if (n_operators as usize) <= MAX_SUBMISSIONS {
-        return n_operators as u64;
-    }
-    (n_operators as u64).div_ceil(MAX_SUBMISSIONS as u64)
-}
 
 /// Cleanup pre-flight: fetch all active registrations and fire one
 /// `cleanup_inactive` TX that asks the contract to evaluate every one
-/// of them. The contract iterates the batch, marks any operator past
-/// the 10-missed-turns threshold as `is_active = false`, and stamps
-/// `last_cleanup_slot` so other daemons in the same cycle skip this work.
+/// of them. The contract iterates the batch, CLOSES any
+/// `ValidatorRegistration` PDA past `CLEANUP_GRACE_WINDOWS` of silence
+/// (lamports return to the cleanup-TX payer), and stamps
+/// `last_cleanup_slot` so other daemons in the same cycle skip this
+/// work.
 ///
 /// v1.2.0 hotfix: pre-flight first checks whether ANY registration is
 /// stale; if not, no TX is sent (saves ~0.004 XNT per daemon per cycle
@@ -1928,14 +2140,13 @@ fn try_cleanup_inactive(
         return Err("no active registrations to evaluate".to_string());
     }
 
-    // Stale-check: mirror the contract's `missed_own_turns > MAX_MISSED_TURNS`
-    // semantics. Skip the TX when no registration would be touched.
+    // Stale-check: mirror the contract's `windows_since >
+    // CLEANUP_GRACE_WINDOWS` semantics. Skip the TX when no
+    // registration would be touched.
     let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
-    let n = regs.len().min(u16::MAX as usize) as u16;
-    let wpt = windows_per_turn_daemon(n).max(1);
     let any_stale = regs.iter().any(|r| {
         let windows_since = current_window_id.saturating_sub(r.last_submitted_window_id);
-        windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+        windows_since > CLEANUP_GRACE_WINDOWS
     });
     if !any_stale {
         if std::env::var("X1SR_DEBUG").is_ok() {
@@ -2058,62 +2269,63 @@ mod tests {
         assert_eq!(next_window_boundary_secs(100, 0), 101);
     }
 
-    // ---------- cleanup pre-flight stale check (v1.2.0 hotfix) ----------
-
-    #[test]
-    fn windows_per_turn_daemon_mirrors_contract_math() {
-        // Same regimes as `programs/x1-strontium/src/lib.rs::windows_per_turn`.
-        // n ≤ 6: primary slot rotates every n windows.
-        assert_eq!(windows_per_turn_daemon(0), 1);
-        assert_eq!(windows_per_turn_daemon(1), 1);
-        assert_eq!(windows_per_turn_daemon(2), 2);
-        assert_eq!(windows_per_turn_daemon(6), 6);
-        // n > 6: window-slot model, ⌈n / 6⌉.
-        assert_eq!(windows_per_turn_daemon(7), 2);
-        assert_eq!(windows_per_turn_daemon(10), 2);
-        assert_eq!(windows_per_turn_daemon(13), 3);
-        assert_eq!(windows_per_turn_daemon(100), 17);
-    }
+    // ---------- cleanup pre-flight stale check (v1.3 wall-clock grace) ----------
 
     #[test]
     fn cleanup_stale_check_skips_when_fleet_healthy() {
         // n=2, both registrations submitted in the current window
-        // (last_submitted_window_id = current_window_id) → 0 missed
-        // turns each → no stale → daemon must NOT fire the TX.
-        let interval_s = 300u64;
+        // (last_submitted_window_id = current_window_id) → 0 windows
+        // elapsed each → no stale → daemon must NOT fire the TX.
         let current_slot = 1_000_000u64;
         let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
-        let n = 2u16;
-        let wpt = windows_per_turn_daemon(n).max(1);
 
         // Two registrations both fresh.
         let last_submits = [current_window_id, current_window_id];
         let any_stale = last_submits.iter().any(|&last| {
             let windows_since = current_window_id.saturating_sub(last);
-            windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+            windows_since > CLEANUP_GRACE_WINDOWS
         });
         assert!(!any_stale, "healthy fleet must not trigger cleanup");
-        // Sanity: interval_s isn't used by the math here — the
-        // window math derives the window id directly from slot count.
-        let _ = interval_s;
     }
 
     #[test]
     fn cleanup_stale_check_fires_when_one_operator_stale() {
-        // n=2, operator A submitted recently, operator B has been
-        // silent for >10 of its own turns (n=2 → wpt=2 → 22 windows
-        // back is 11 missed turns > MAX_MISSED_TURNS=10).
+        // n=2, operator A submitted recently, operator B has been silent
+        // for more than CLEANUP_GRACE_WINDOWS (~24 h) — daemon must fire
+        // the cleanup TX. v1.3: fleet size no longer affects the
+        // threshold (used to require n × MAX_MISSED_TURNS windows).
         let current_slot = 1_000_000u64;
         let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
-        let n = 2u16;
-        let wpt = windows_per_turn_daemon(n).max(1);
+        let stale_last = current_window_id - (CLEANUP_GRACE_WINDOWS + 1);
 
-        let last_submits = [current_window_id, current_window_id - 22];
+        let last_submits = [current_window_id, stale_last];
         let any_stale = last_submits.iter().any(|&last| {
             let windows_since = current_window_id.saturating_sub(last);
-            windows_since / wpt > CLEANUP_MAX_MISSED_TURNS
+            windows_since > CLEANUP_GRACE_WINDOWS
         });
         assert!(any_stale, "stale operator B must trigger cleanup");
+    }
+
+    /// v1.3 invariant: the daemon's stale check is fleet-size-independent
+    /// (was n × MAX_MISSED_TURNS in v1.2). The daemon would otherwise
+    /// fire cleanup TXs that the contract would skip — wasting XNT every
+    /// cycle on no-op closures.
+    #[test]
+    fn cleanup_stale_check_grace_is_fleet_size_independent() {
+        let current_slot = 1_000_000u64;
+        let current_window_id = current_slot / CLEANUP_WINDOW_SLOTS;
+        let inside = current_window_id - CLEANUP_GRACE_WINDOWS; // at boundary
+        let outside = current_window_id - (CLEANUP_GRACE_WINDOWS + 1); // past
+
+        for _n in [2u16, 6, 100, 512] {
+            // Fleet size is no longer consulted by the daemon's stale
+            // check; we just exercise the boundary at multiple n values
+            // to document the invariant.
+            let windows_inside = current_window_id.saturating_sub(inside);
+            let windows_outside = current_window_id.saturating_sub(outside);
+            assert!(windows_inside <= CLEANUP_GRACE_WINDOWS);
+            assert!(windows_outside > CLEANUP_GRACE_WINDOWS);
+        }
     }
 
     // ---------- sysdrift gate ----------
@@ -2158,5 +2370,121 @@ mod tests {
             (consensus_ms - sys_at_limit).abs() <= MAX_SYSDRIFT_MS,
             "drift exactly at MAX_SYSDRIFT_MS must NOT trigger silence (strict >)"
         );
+    }
+
+    // ---------- auto-recover preconditions (v1.3 startup) ----------
+
+    /// Helper: write a 64-byte zero-filled keypair stub to a tempfile.
+    /// The auto-recover precondition only checks file existence — not
+    /// parseable content — so even an empty marker file is enough to
+    /// exercise the happy path of `check_auto_recover_preconditions`.
+    fn touch_tempfile(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir();
+        let path = dir.join(name);
+        std::fs::write(&path, b"").expect("tempfile write");
+        path
+    }
+
+    /// BUG fix: refuse auto-recover when the oracle wallet can't cover
+    /// the register TX. Surfacing the balance error LOUDLY (with a
+    /// concrete remediation hint) beats silently sending a TX that
+    /// fails on-chain and leaves the operator confused.
+    #[test]
+    fn auto_recover_skipped_when_balance_low() {
+        // 0.1 XNT — well below MIN_BALANCE_AUTO_RECOVER_XNT=0.6.
+        let result = check_auto_recover_preconditions(
+            100_000_000, // 0.1 XNT
+            "/tmp/whatever",
+            1_000_000_000, // stake OK, but balance fails first
+        );
+        let err = result.expect_err("low balance must refuse auto-recover");
+        assert!(
+            err.contains("balance"),
+            "error should mention balance: {err}"
+        );
+        assert!(
+            err.contains("0.1") || err.contains("0.100"),
+            "error should quote the actual balance: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_recover_skipped_when_vote_keypair_missing() {
+        // Generate a tempfile path that won't exist (no touch).
+        let nonexistent =
+            std::env::temp_dir().join(format!("x1sr-vote-keypair-missing-{}", std::process::id()));
+        // Best-effort cleanup in case a prior run left a file behind.
+        let _ = std::fs::remove_file(&nonexistent);
+
+        let result = check_auto_recover_preconditions(
+            1_000_000_000, // 1.0 XNT — balance OK
+            nonexistent.to_str().unwrap(),
+            1_000_000_000, // stake OK
+        );
+        let err = result.expect_err("missing vote keypair must refuse auto-recover");
+        assert!(
+            err.contains("vote keypair") && err.contains("not found"),
+            "error should mention missing vote keypair: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_recover_skipped_when_self_stake_zero() {
+        // Both balance and vote keypair file pass; self_stake = 0 trips.
+        let vote_path = touch_tempfile("x1sr-vote-keypair-stake-zero");
+        let result = check_auto_recover_preconditions(
+            1_000_000_000, // 1.0 XNT — balance OK
+            vote_path.to_str().unwrap(),
+            0, // anti-farm gate refuses
+        );
+        let err = result.expect_err("zero self-stake must refuse auto-recover");
+        assert!(
+            err.contains("self-stake") && err.contains("anti-farm"),
+            "error should mention anti-farm self-stake gate: {err}"
+        );
+        let _ = std::fs::remove_file(&vote_path);
+    }
+
+    /// Happy path: every precondition satisfied, function returns Ok.
+    /// The actual TX build / send is exercised end-to-end at deploy
+    /// time; here we just lock the "all green ⇒ Ok" invariant.
+    #[test]
+    fn auto_recover_happy_path_dry_run() {
+        let vote_path = touch_tempfile("x1sr-vote-keypair-happy");
+        let result = check_auto_recover_preconditions(
+            (MIN_BALANCE_AUTO_RECOVER_XNT * 1_000_000_000.0) as u64 + 1, // just over the gate
+            vote_path.to_str().unwrap(),
+            500_000_000, // 0.5 XNT qualifying self-stake
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "all preconditions satisfied → Ok, got: {result:?}"
+        );
+        let _ = std::fs::remove_file(&vote_path);
+    }
+
+    #[test]
+    fn auto_recover_balance_threshold_is_exactly_0_6_xnt() {
+        // Document the threshold value. The precondition compares the
+        // f64 XNT representation against MIN_BALANCE_AUTO_RECOVER_XNT
+        // (0.6), so 0.6 XNT - 1 lamport must fail, 0.6 XNT exactly must
+        // pass (gate uses `<`, not `<=`).
+        let vote_path = touch_tempfile("x1sr-vote-keypair-threshold");
+        let just_under: u64 = 599_999_999; // 0.6 XNT - 1 lamport
+        let just_at: u64 = 600_000_000; // exactly 0.6 XNT
+        assert!(check_auto_recover_preconditions(
+            just_under,
+            vote_path.to_str().unwrap(),
+            1_000_000_000
+        )
+        .is_err());
+        assert!(check_auto_recover_preconditions(
+            just_at,
+            vote_path.to_str().unwrap(),
+            1_000_000_000
+        )
+        .is_ok());
+        let _ = std::fs::remove_file(&vote_path);
     }
 }

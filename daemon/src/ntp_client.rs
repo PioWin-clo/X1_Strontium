@@ -16,8 +16,8 @@ pub struct NtpSource {
     pub tier: NtpTier,
 }
 
-/// 43 NTP sources (31 Stratum1/NTS-capable + 12 pool fallbacks) across 6
-/// continents. u64 bitmap, capacity 64, headroom 21 slots.
+/// 45 NTP sources (33 Stratum1/NTS-capable + 12 pool fallbacks) across 6
+/// continents. u64 bitmap, capacity 64, headroom 19 slots.
 ///
 /// Verified reachable from Warsaw (Piotr's dev box, 2026-04-22) via SNTPv3
 /// probe of 49 candidate hosts — see `/tmp/ntp_audit.log`. Removed from the
@@ -26,9 +26,29 @@ pub struct NtpSource {
 /// działa), `syrte.obspm.fr` (Paris observatory, rejects plain NTP),
 /// `b.st1.ntp.br` (Brazil Stratum1 non-responsive — `a.st1` działa),
 /// `stdtime.gov.hk` (HK gov, geo-restrict / firewall). Also dropped as
-/// redundant siblings to trim to 43 for the bitmap budget: `ntp2.fau.de`,
+/// redundant siblings to trim for the bitmap budget: `ntp2.fau.de`,
 /// `tempus2.gum.gov.pl`, `ntp2.nl.net`, `time-a/d-wwv.nist.gov`,
 /// `ntp1.net.berkeley.edu`, `ntp.cida.gob.ve`.
+///
+/// Added in v1.3 (2026-05-08 dev-box probe):
+///   - `hora.roa.es` — Real Instituto y Observatorio de la Armada,
+///     Spain (Stratum1, EU) — RTT +0.004 ms in probe
+///   - `time2.kriss.re.kr` — Korea Research Institute of Standards
+///     and Science (Stratum1, Asia, sibling of existing
+///     `time.kriss.re.kr`) — RTT +0.002 ms in probe
+///
+/// Deferred to v1.3.1 pending a probe from the Sentinel production
+/// network (different ISP than the Warsaw dev box, which has geo /
+/// firewall issues for some Stratum1 servers):
+///   - `tick.usno.navy.mil`, `tock.usno.navy.mil` — US Naval Observatory
+///     (timeout from Warsaw, fallback `time-d-g.nist.gov` also timed out)
+///   - `ntp1.inrim.it` — Istituto Nazionale di Ricerca Metrologica
+///     (connect failure from Warsaw, fallback `ntp.ien.it` also failed)
+///   - `b.st1.ntp.br` re-test — still non-responsive in v1.3 probe
+///
+/// Stratum re-label in v1.3: `oregon/virginia.time.system76.com` declare
+/// stratum 1 but plain-NTP responses come back stratum 2; treat them as
+/// Stratum 2 for consensus weighting until they upgrade.
 ///
 /// Index 0..63 maps directly into `ConsensusResult::sources_bitmap` (u64).
 pub const NTP_SOURCES: &[NtpSource] = &[
@@ -57,16 +77,20 @@ pub const NTP_SOURCES: &[NtpSource] = &[
         stratum: 1,
         tier: NtpTier::Nts,
     },
+    // v1.3 relabel: System76 NTS endpoints advertise Stratum 1 but
+    // plain-NTP probes consistently return Stratum 2. Mark as 2 for
+    // honest consensus weighting; upgrade if they ever fix their
+    // upstream chain.
     NtpSource {
         host: "oregon.time.system76.com",
         port: 123,
-        stratum: 1,
+        stratum: 2,
         tier: NtpTier::Nts,
     },
     NtpSource {
         host: "virginia.time.system76.com",
         port: 123,
-        stratum: 1,
+        stratum: 2,
         tier: NtpTier::Nts,
     },
     // ---- 13 Stratum-1 Europe ----
@@ -126,6 +150,14 @@ pub const NTP_SOURCES: &[NtpSource] = &[
     },
     NtpSource {
         host: "ntp1.nl.net",
+        port: 123,
+        stratum: 1,
+        tier: NtpTier::Stratum1,
+    },
+    // Added in v1.3: Spain Stratum1 (Real Instituto y Observatorio
+    // de la Armada). Probe from Warsaw: +0.004 ms ±0.065 ms.
+    NtpSource {
+        host: "hora.roa.es",
         port: 123,
         stratum: 1,
         tier: NtpTier::Stratum1,
@@ -200,6 +232,14 @@ pub const NTP_SOURCES: &[NtpSource] = &[
     },
     NtpSource {
         host: "time.kriss.re.kr",
+        port: 123,
+        stratum: 1,
+        tier: NtpTier::Stratum1,
+    },
+    // Added in v1.3: KRISS sibling endpoint (geo-redundant, same
+    // facility). Probe from Warsaw: +0.002 ms ±0.242 ms.
+    NtpSource {
+        host: "time2.kriss.re.kr",
         port: 123,
         stratum: 1,
         tier: NtpTier::Stratum1,

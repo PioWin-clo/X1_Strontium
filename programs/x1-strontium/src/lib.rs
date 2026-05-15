@@ -1,4 +1,4 @@
-//! # X1 Strontium v1.2.1
+//! # X1 Strontium v1.3.0
 //!
 //! Decentralised atomic-time oracle for the X1 blockchain. The contract
 //! uses a file-based oracle keypair model: each operator runs a daemon that
@@ -30,21 +30,25 @@
 //!
 //! ## Auto-cleanup
 //!
-//! The contract removes operators who miss too many of their own rotation
-//! turns. `submit_time` updates only the caller's `last_submitted_window_id`
-//! (cheap, fixed-cost). A separate `cleanup_inactive` instruction can be
-//! called by anyone with a batch of `ValidatorRegistration` accounts in
-//! `remaining_accounts`; for each stale one it CLOSES the PDA — lamports
-//! return to `payer` (the cleanup-TX signer), the data is zeroed and the
-//! discriminator is overwritten with `CLOSED_ACCOUNT_DISCRIMINATOR`.
-//! Closing the PDA (rather than just flipping `is_active = false`) is what
-//! allows the same `oracle_keypair` to re-register after the contract
-//! garbage-collects the address. `n_operators` and `quorum_threshold` are
+//! Operators who don't submit `submit_time` for `CLEANUP_GRACE_WINDOWS`
+//! contract-windows (~24 h) get their `ValidatorRegistration` PDA closed
+//! by `cleanup_inactive`. `submit_time` updates only the caller's
+//! `last_submitted_window_id` (cheap, fixed-cost). A separate
+//! `cleanup_inactive` instruction can be called by anyone with a batch of
+//! `ValidatorRegistration` accounts in `remaining_accounts`; for each
+//! stale one it CLOSES the PDA — lamports return to `payer` (the
+//! cleanup-TX signer), the data is zeroed and the discriminator is
+//! overwritten with `CLOSED_ACCOUNT_DISCRIMINATOR`. Closing the PDA
+//! (rather than just flipping `is_active = false`) is what allows the
+//! same `oracle_keypair` to re-register after the contract garbage-
+//! collects the address. `n_operators` and `quorum_threshold` are
 //! recomputed atomically.
 //!
-//! At fleet size n=2 a missed-turn bound of 10 collapses into ~100 minutes
-//! of inactivity; at n=100 it spans roughly 14 hours. Threshold scales
-//! naturally with fleet size.
+//! v1.3 changed the staleness threshold from a per-fleet-size missed-
+//! turn count (`missed_own_turns > MAX_MISSED_TURNS`, ~22 min tolerance
+//! at n=2) to a fixed wall-clock window (`windows_since > 1440`, ~24 h
+//! regardless of n). The grace covers reboots, maintenance windows, and
+//! transient network outages without surprising operators of small fleets.
 //!
 //! ## Removed vs prior versions
 //!
@@ -82,11 +86,19 @@ pub const MIN_CONFIDENCE: u8 = 60;
 /// Maximum allowed offset spread between aggregated NTP samples.
 pub const MAX_SPREAD_MS: i64 = 50;
 
-/// An operator who misses strictly more than this many of their own
-/// rotation turns in a row gets their `ValidatorRegistration` PDA closed
-/// by `cleanup_inactive` (lamports return to the cleanup-TX payer; the
-/// PDA address is freed for re-registration).
-pub const MAX_MISSED_TURNS: u8 = 10;
+/// Operators whose `last_submitted_window_id` lags the current window by
+/// strictly more than this many contract-windows get their
+/// `ValidatorRegistration` PDA closed by `cleanup_inactive`. At
+/// `WINDOW_SLOTS = 150` slots and ~400 ms/slot, one contract-window is
+/// ~60 s, so 1440 windows ≈ 24 h. The grace is independent of fleet size
+/// `n`: a fresh operator and a member of a 500-operator fleet get the
+/// same wall-clock tolerance to recover from a reboot, network blip, or
+/// scheduled maintenance.
+///
+/// Replaces v1.2's `MAX_MISSED_TURNS = 10`, which used
+/// `missed_own_turns = windows_since / windows_per_turn(n)` and at `n=2`
+/// (wpt=2) cleaned operators after only ~22 min (`11 × 2 × 60 s`).
+pub const CLEANUP_GRACE_WINDOWS: u64 = 1440;
 
 /// Bootstrap-mode threshold: the oracle reports `is_degraded = 1`
 /// regardless of per-window quorum and confidence whenever the active
@@ -266,7 +278,7 @@ pub mod x1_strontium {
     /// (effectively a small reward for paying the TX fee). For each
     /// registration in `remaining_accounts`:
     ///
-    /// - **Active and stale** (`missed_own_turns > MAX_MISSED_TURNS`):
+    /// - **Active and stale** (`windows_since > CLEANUP_GRACE_WINDOWS`):
     ///   close the PDA, decrement `n_operators`.
     /// - **Already inactive** (legacy v1.2.0 leftover where the PDA was
     ///   flagged `is_active = false` but never closed): close the PDA,
@@ -279,7 +291,11 @@ pub mod x1_strontium {
     /// re-registering the same `oracle_keypair` impossible — Anchor's
     /// `init` constraint rejected it with "account already in use".
     ///
-    /// `quorum_threshold` and `last_cleanup_slot` are updated atomically.
+    /// v1.3 swapped the staleness check from the per-fleet-size
+    /// `missed_own_turns > MAX_MISSED_TURNS` math (~22 min tolerance at
+    /// n=2) to the fixed `windows_since > CLEANUP_GRACE_WINDOWS` check
+    /// (~24 h regardless of n). `quorum_threshold` and
+    /// `last_cleanup_slot` are updated atomically.
     pub fn cleanup_inactive<'info>(
         ctx: Context<'_, '_, 'info, 'info, CleanupInactive<'info>>,
     ) -> Result<()> {
@@ -401,9 +417,11 @@ fn required_quorum(n_operators: u16) -> u16 {
 }
 
 /// Average number of windows between consecutive turns for any single
-/// operator under the daemon's `rotation.rs` election rules. The single
-/// source of truth shared by the contract's `cleanup_inactive` math and
-/// the daemon's pre-flight scheduling.
+/// operator under the daemon's `rotation.rs` election rules. v1.3 no
+/// longer uses this for `cleanup_inactive` (replaced by the fixed
+/// `CLEANUP_GRACE_WINDOWS` wall-clock check); retained as a pure helper
+/// for rotation diagnostics and for callers that want a fleet-size-
+/// aware "average windows between my turns" estimate.
 ///
 /// Three regimes (matching `daemon/src/rotation.rs::rotation_my_turn_at`):
 /// - n ≤ 2 — primary-only; primary slot rotates every n windows.
@@ -426,7 +444,10 @@ pub fn windows_per_turn(n_operators: u16) -> u64 {
 }
 
 /// How many of the operator's own rotation turns have passed without a
-/// submission. Used by `cleanup_inactive` to decide who to mark inactive.
+/// submission. **No longer used by `cleanup_inactive` in v1.3+ — kept as
+/// a pure helper for rotation diagnostics** (e.g. an operator-facing
+/// "you have missed X of your scheduled turns" log). v1.3 cleanup uses
+/// `CLEANUP_GRACE_WINDOWS` as a fixed wall-clock check instead.
 ///
 /// The window IDs are absolute (`slot / WINDOW_SLOTS`), so for a freshly
 /// registered operator we phantom-submit at register time — see
@@ -448,34 +469,37 @@ pub fn missed_own_turns(
 /// recovered) but `n_operators` must NOT be touched again.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CleanupDecision {
-    /// Active operator, missed-turn count under the threshold — leave alone.
+    /// Active operator inside the `CLEANUP_GRACE_WINDOWS` grace — leave alone.
     Skip,
     /// Already-inactive PDA from a v1.2.0 cleanup run. Close to recover
     /// rent and free the address; do not decrement `n_operators`.
     CloseLegacy,
-    /// Active operator past the missed-turn threshold. Close and
+    /// Active operator past the `CLEANUP_GRACE_WINDOWS` grace. Close and
     /// decrement `n_operators` / recompute quorum.
     CloseStale,
 }
 
 /// Pure dispatch for `cleanup_inactive`'s per-registration handling.
-/// Extracted so cargo test can exercise the v1.2.1 branching (legacy
-/// vs active-stale vs skip) without a Solana runtime.
+/// Extracted so cargo test can exercise the close-vs-skip branching
+/// (legacy / active-stale / skip) without a Solana runtime.
+///
+/// v1.3 simplification: instead of `missed_own_turns > MAX_MISSED_TURNS`
+/// (per-fleet-size, ~22 min tolerance at n=2), the active-stale check is
+/// now the direct `windows_since > CLEANUP_GRACE_WINDOWS` comparison
+/// (~24 h regardless of fleet size). `_n_operators_at_start` is kept on
+/// the signature so the contract loop call site stays unchanged and
+/// any external caller wrapping this helper need not be edited.
 pub fn cleanup_decision(
     is_active: bool,
     current_window_id: u64,
     last_submitted_window_id: u64,
-    n_operators_at_start: u16,
+    _n_operators_at_start: u16,
 ) -> CleanupDecision {
     if !is_active {
         return CleanupDecision::CloseLegacy;
     }
-    let missed = missed_own_turns(
-        current_window_id,
-        last_submitted_window_id,
-        n_operators_at_start,
-    );
-    if missed > MAX_MISSED_TURNS as u64 {
+    let windows_since = current_window_id.saturating_sub(last_submitted_window_id);
+    if windows_since > CLEANUP_GRACE_WINDOWS {
         CleanupDecision::CloseStale
     } else {
         CleanupDecision::Skip
@@ -946,7 +970,8 @@ mod tests {
         assert!(WINDOW_SLOTS > 0);
         assert!(MIN_CONFIDENCE > 0 && MIN_CONFIDENCE <= 100);
         assert!(MAX_SPREAD_MS > 0);
-        assert!(MAX_MISSED_TURNS > 0);
+        // v1.3 grace window: at least 1 h, target ~24 h.
+        assert!(CLEANUP_GRACE_WINDOWS >= 60);
     }
 
     // -----------------------------------------------------------------------
@@ -984,7 +1009,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // missed_own_turns + cleanup boundary behaviour
+    // missed_own_turns helper (retained, no longer drives cleanup in v1.3+)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -993,48 +1018,82 @@ mod tests {
         assert_eq!(missed_own_turns(1_000_000, 1_000_000, 2), 0);
     }
 
+    // -----------------------------------------------------------------------
+    // cleanup boundary behaviour (v1.3 fixed wall-clock grace)
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn cleanup_marks_operator_inactive_after_10_missed_own_turns() {
-        // At n=2, windows_per_turn = 2. The cleanup boundary is "strictly
-        // greater than MAX_MISSED_TURNS", so we must see at least 11
-        // missed turns ⇒ at least 22 windows elapsed.
+    fn cleanup_marks_after_grace_window() {
+        // v1.3: cleanup_decision returns CloseStale when windows_since
+        // strictly exceeds CLEANUP_GRACE_WINDOWS. At 1441 windows
+        // (~24 h + 1 min) the operator is past grace regardless of n.
         let last = 1_000_000u64;
-        let current = last + 22;
-        let missed = missed_own_turns(current, last, 2);
-        assert_eq!(missed, 11);
-        assert!(missed > MAX_MISSED_TURNS as u64);
+        let current = last + CLEANUP_GRACE_WINDOWS + 1; // 1441 at default
+        assert_eq!(
+            cleanup_decision(true, current, last, 2),
+            CleanupDecision::CloseStale
+        );
     }
 
     #[test]
-    fn cleanup_does_not_mark_active_operator_inactive() {
-        // 5 missed turns at n=2 (10 windows elapsed) — comfortably below
-        // the threshold.
+    fn cleanup_keeps_active_operator() {
+        // windows_since well below grace ⇒ Skip. Picks 12 windows
+        // (~12 min — typical reboot / maintenance window) at n=2.
         let last = 1_000_000u64;
-        let current = last + 10;
-        let missed = missed_own_turns(current, last, 2);
-        assert_eq!(missed, 5);
-        assert!(missed <= MAX_MISSED_TURNS as u64);
+        let current = last + 12;
+        assert_eq!(
+            cleanup_decision(true, current, last, 2),
+            CleanupDecision::Skip
+        );
     }
 
     #[test]
-    fn cleanup_boundary_at_exactly_max_missed_turns_keeps_active() {
-        // Exactly MAX_MISSED_TURNS missed turns must NOT remove — the
-        // contract uses strict `>` to give an inclusive grace.
+    fn cleanup_boundary_at_exact_grace_window_keeps_active() {
+        // windows_since == CLEANUP_GRACE_WINDOWS must NOT remove — the
+        // contract uses strict `>` to give an inclusive grace. The
+        // operator is exactly at the 24 h mark and survives by one
+        // window.
         let last = 1_000_000u64;
-        let current = last + 20; // 10 missed at n=2
-        let missed = missed_own_turns(current, last, 2);
-        assert_eq!(missed, MAX_MISSED_TURNS as u64);
-        assert!(missed <= MAX_MISSED_TURNS as u64);
+        let current = last + CLEANUP_GRACE_WINDOWS; // 1440
+        assert_eq!(
+            cleanup_decision(true, current, last, 2),
+            CleanupDecision::Skip
+        );
+    }
+
+    /// Core v1.3 invariant: cleanup grace is wall-clock, not
+    /// per-operator-turn. A fleet of 2 and a fleet of 512 use the same
+    /// 1440-window grace, so a missed turn for a solo operator and a
+    /// missed turn for a member of a huge fleet have identical
+    /// consequences time-wise.
+    #[test]
+    fn cleanup_grace_is_fleet_size_independent() {
+        let last = 1_000_000u64;
+        let stale_current = last + CLEANUP_GRACE_WINDOWS + 1; // past grace
+        let inside_current = last + CLEANUP_GRACE_WINDOWS; // at boundary
+
+        for n in [2u16, 6, 100, 512] {
+            assert_eq!(
+                cleanup_decision(true, stale_current, last, n),
+                CleanupDecision::CloseStale,
+                "n={n}: past-grace operator must be CloseStale regardless of fleet size"
+            );
+            assert_eq!(
+                cleanup_decision(true, inside_current, last, n),
+                CleanupDecision::Skip,
+                "n={n}: operator at exact boundary must survive regardless of fleet size"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
-    // cleanup_decision (v1.2.1 close-instead-of-flag dispatch)
+    // cleanup_decision dispatch (v1.3 fixed-grace logic)
     // -----------------------------------------------------------------------
 
     #[test]
     fn cleanup_decision_active_recent_skips() {
         // Operator submitted in the most recent window — still active,
-        // missed = 0. Must not be touched.
+        // windows_since = 0. Must not be touched.
         let last = 1_000_000u64;
         let current = last; // same window
         assert_eq!(
@@ -1045,10 +1104,10 @@ mod tests {
 
     #[test]
     fn cleanup_decision_active_at_boundary_skips() {
-        // Exactly MAX_MISSED_TURNS missed turns — boundary stays active
+        // Exactly CLEANUP_GRACE_WINDOWS elapsed — boundary stays active
         // because the contract uses strict `>` for the threshold.
         let last = 1_000_000u64;
-        let current = last + 20; // 10 missed at n=2 == MAX_MISSED_TURNS
+        let current = last + CLEANUP_GRACE_WINDOWS; // 1440
         assert_eq!(
             cleanup_decision(true, current, last, 2),
             CleanupDecision::Skip
@@ -1057,23 +1116,23 @@ mod tests {
 
     #[test]
     fn cleanup_decision_active_stale_returns_close_stale() {
-        // 11 missed turns at n=2 (22 windows elapsed) → close + decrement.
+        // windows_since = CLEANUP_GRACE_WINDOWS + 1 → close + decrement.
         let last = 1_000_000u64;
-        let current = last + 22;
+        let current = last + CLEANUP_GRACE_WINDOWS + 1;
         assert_eq!(
             cleanup_decision(true, current, last, 2),
             CleanupDecision::CloseStale
         );
     }
 
-    /// v1.2.1 legacy path — a v1.2.0 cleanup run set is_active=false but
-    /// did not close the PDA. The new dispatch must close such PDAs
-    /// without further n_operators bookkeeping (already counted at the
-    /// original flagging time).
+    /// Legacy path — a v1.2.0 cleanup run set is_active=false but did
+    /// not close the PDA. The dispatch must close such PDAs without
+    /// further n_operators bookkeeping (already counted at the original
+    /// flagging time). Independent of windows_since.
     #[test]
     fn cleanup_decision_already_inactive_returns_close_legacy() {
         let last = 1_000_000u64;
-        let current = last + 22; // would be stale, but is_active=false short-circuits
+        let current = last + CLEANUP_GRACE_WINDOWS + 1; // would be stale, but inactive short-circuits
         assert_eq!(
             cleanup_decision(false, current, last, 2),
             CleanupDecision::CloseLegacy
@@ -1092,17 +1151,18 @@ mod tests {
     /// and verifies the resulting state matches the dispatch.
     #[test]
     fn cleanup_decision_batch_matches_close_and_removed_counts() {
-        // Mock fleet of 3 active operators (windows_per_turn(3) = 3,
-        // so >10 missed turns needs ≥33 windows since last submit).
+        // Mock fleet of 3 active operators. v1.3: stale check is
+        // wall-clock, independent of fleet size — any windows_since
+        // strictly greater than CLEANUP_GRACE_WINDOWS triggers close.
         // - one fresh (skip)
-        // - one active+stale (close + decrement)
+        // - one active + past grace (close + decrement)
         // - one already-inactive legacy leftover (close, no decrement)
         let n_at_start: u16 = 3;
-        let current = 1_000_033u64;
+        let current = 1_000_000u64 + CLEANUP_GRACE_WINDOWS + 1;
         let cases: Vec<(bool, u64, CleanupDecision)> = vec![
             (true, current, CleanupDecision::Skip),
-            (true, current - 33, CleanupDecision::CloseStale),
-            (false, current - 33, CleanupDecision::CloseLegacy),
+            (true, 1_000_000u64, CleanupDecision::CloseStale),
+            (false, 1_000_000u64, CleanupDecision::CloseLegacy),
         ];
 
         let mut closed = 0u16;
@@ -1165,25 +1225,25 @@ mod tests {
         // Regression test for the v1.0 bug we deliberately guard against:
         // if `register_submitter` left `last_submitted_window_id` at 0
         // instead of phantom-submitting at the current window, the very
-        // next `cleanup_inactive` would compute a millions-of-windows-since
-        // count and remove the freshly registered operator. Phantom-submit
-        // means missed-count starts at 0 immediately after register and
-        // grows in step with rotation, so a short post-register pause
-        // never crosses the threshold.
+        // next `cleanup_inactive` would compute a millions-of-windows
+        // gap and remove the freshly registered operator. Phantom-submit
+        // means windows_since starts at 0 immediately after register
+        // and grows linearly, so a short post-register pause never
+        // crosses the grace window.
         //
         // We advance by ~1 h (12 windows at 5 min/window) and verify the
-        // operator stays active for every realistic fleet size. n=1 is
-        // excluded because the solo-operator grace period is only 50 min
-        // by design (primary every window, MAX_MISSED_TURNS=10) — that
-        // path is covered by the boundary tests above.
+        // operator stays active for every fleet size. v1.3: the check is
+        // wall-clock (`windows_since > CLEANUP_GRACE_WINDOWS = 1440`), so
+        // the result is identical for n=1 too — no per-fleet-size carve-
+        // out needed.
         let registered_window = 1_234_567u64;
         let current_window = registered_window + 12;
 
-        for n in [2u16, 3, 6, 7, 10, 100, 512] {
-            let missed = missed_own_turns(current_window, registered_window, n);
-            assert!(
-                missed <= MAX_MISSED_TURNS as u64,
-                "n={n}: expected freshly registered operator to survive 1 h of inactivity, got missed={missed}"
+        for n in [1u16, 2, 3, 6, 7, 10, 100, 512] {
+            assert_eq!(
+                cleanup_decision(true, current_window, registered_window, n),
+                CleanupDecision::Skip,
+                "n={n}: freshly registered operator must survive 1 h of inactivity"
             );
         }
     }

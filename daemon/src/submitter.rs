@@ -726,9 +726,20 @@ pub struct SubmitParams<'a> {
     pub precise_time_ms: i64,
     /// The daemon's `SystemTime::now()` (UTC ms) captured at the moment the
     /// consensus was computed — i.e. before TSC correction. Recorded for
-    /// the memo's `sys=` and `sysdrift=` fields, which signal the health of
-    /// the daemon's underlying system clock relative to the NTP consensus.
+    /// the memo's `sys=` field.
     pub sys_at_consensus_ms: i64,
+    /// Cached system-clock drift `consensus.timestamp_ms -
+    /// sys_at_consensus_ms` captured at the NTP poll moment. The memo's
+    /// `sysdrift=` field reads this directly — it must NOT be recomputed
+    /// as `precise_time_ms - sys_at_consensus_ms`, because under the v1.2
+    /// pre-poll architecture `precise_time_ms = system_clock_now() +
+    /// sysdrift_ms` and `sys_at_consensus_ms` is a snapshot from
+    /// `PREPOLL_LEAD_SECS` (~30 s) earlier — the recompute substitutes
+    /// to `sysdrift + (sys_now - sys_at_consensus)` and the lead bleeds
+    /// through as a phantom ~30 s drift in every memo (v1.2.1 fixed the
+    /// equivalent bug for the `x1sr status` renderer; v1.3 fixes it for
+    /// the memo).
+    pub sysdrift_ms: i64,
 }
 
 fn best_stratum(consensus: &ConsensusResult) -> u8 {
@@ -778,7 +789,11 @@ fn build_memo(params: &SubmitParams) -> String {
     let prefix = time_source_prefix(params.consensus);
     let time_str = format_clock_3dec(params.precise_time_ms);
     let sys_str = format_clock_3dec(params.sys_at_consensus_ms);
-    let sysdrift = params.precise_time_ms - params.sys_at_consensus_ms;
+    // v1.3 fix: read the cached sysdrift snapshot from the NTP poll
+    // moment. Recomputing `precise_time_ms - sys_at_consensus_ms` here
+    // would surface the ~30 s pre-poll lead as phantom drift in every
+    // memo — see SubmitParams::sysdrift_ms for the full explanation.
+    let sysdrift = params.sysdrift_ms;
     let (chain_str, drift_str) = match params.chain_time_ms {
         Some(t) => (
             format_clock_3dec(t),
@@ -1392,8 +1407,14 @@ mod tests {
             chain_time_ms,
             precise_time_ms,
             // Default to sys = precise + 5 ms — gives a stable, non-zero
-            // sysdrift in tests. Override per-test where needed.
+            // sys offset in tests. Override per-test where needed.
             sys_at_consensus_ms: precise_time_ms + 5,
+            // Default cached sysdrift matches the old "precise - sys"
+            // recompute (-5) so tests that don't override see a stable
+            // value. v1.3 build_memo reads this field directly instead
+            // of recomputing — tests that exercise the fix override
+            // sysdrift_ms explicitly.
+            sysdrift_ms: -5,
         }
     }
 
@@ -1526,26 +1547,55 @@ mod tests {
     fn memo_v1_has_sys_fields() {
         // Mandate: every memo carries `sys=HH:MM:SS.mmm` and
         // `sysdrift=N` so stat sites can monitor each operator's local
-        // system-clock health alongside the chain drift.
+        // system-clock health alongside the chain drift. v1.3: sysdrift
+        // is read DIRECTLY from `SubmitParams::sysdrift_ms` (cached at
+        // NTP poll moment), not recomputed from sys/precise.
         let c = mock_consensus(vec![mock_source(NtpTier::Stratum1, "s1.x", 1)], false);
-        // precise = 1_713_184_500_003, sys = precise + 5 = 1_713_184_500_008
-        // ⇒ sysdrift = precise - sys = -5
-        let p = mock_params(&c, Some(1_713_184_500_000), 1_713_184_500_003);
+        let mut p = mock_params(&c, Some(1_713_184_500_000), 1_713_184_500_003);
+        p.sysdrift_ms = -7;
         let memo = build_memo(&p);
         assert!(memo.contains(":sys="), "missing :sys= field in: {memo}");
         assert!(
-            memo.contains(":sysdrift=-5:"),
-            "expect :sysdrift=-5: in: {memo}"
+            memo.contains(":sysdrift=-7:"),
+            "expect :sysdrift=-7: in: {memo}"
         );
 
-        // Override sys to be earlier than precise — sysdrift should flip
-        // sign (positive = NTP consensus is ahead of system clock).
+        // Flip sign — positive sysdrift means NTP consensus is ahead of
+        // the system clock.
         let mut p2 = mock_params(&c, Some(1_713_184_500_000), 1_713_184_500_003);
-        p2.sys_at_consensus_ms = 1_713_184_499_990; // 13 ms before precise
+        p2.sysdrift_ms = 13;
         let memo2 = build_memo(&p2);
         assert!(
             memo2.contains(":sysdrift=13:"),
             "expect :sysdrift=13: in: {memo2}"
+        );
+    }
+
+    /// v1.3 bug fix: the memo's `sysdrift=` field must reflect the
+    /// cached drift snapshot from the NTP poll moment, NOT a recompute
+    /// of `precise_time_ms - sys_at_consensus_ms`. Under the v1.2
+    /// pre-poll architecture, precise_time_ms = system_clock_now() +
+    /// sysdrift_ms while sys_at_consensus_ms is captured ~30 s earlier,
+    /// so the recompute substitutes to `sysdrift + lead` and the lead
+    /// bleeds through as ~+30 000 ms phantom drift in every memo.
+    #[test]
+    fn memo_sysdrift_independent_of_prepoll_lead() {
+        let c = mock_consensus(vec![mock_source(NtpTier::Stratum1, "s1.x", 1)], false);
+        let base = 1_713_184_500_000i64;
+        // Simulate the v1.2 pre-poll architecture: precise is 30 s ahead
+        // of sys (because we waited for the window boundary between NTP
+        // poll and submit). The true sysdrift at poll moment was -2 ms.
+        let mut p = mock_params(&c, None, base + 30_000);
+        p.sys_at_consensus_ms = base;
+        p.sysdrift_ms = -2;
+        let memo = build_memo(&p);
+        assert!(
+            memo.contains(":sysdrift=-2:"),
+            "memo must show cached sysdrift=-2 (NOT the recompute artifact ~+29998), got: {memo}"
+        );
+        assert!(
+            !memo.contains(":sysdrift=29998:"),
+            "memo must NOT contain the recompute artifact: {memo}"
         );
     }
 
