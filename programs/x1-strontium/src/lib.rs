@@ -50,10 +50,6 @@
 //! regardless of n). The grace covers reboots, maintenance windows, and
 //! transient network outages without surprising operators of small fleets.
 //!
-//! At fleet size n=2 a missed-turn bound of 10 collapses into ~100 minutes
-//! of inactivity; at n=100 it spans roughly 14 hours. Threshold scales
-//! naturally with fleet size.
-//!
 //! ## Removed vs prior versions
 //!
 //! No migration. No backward compatibility. No legacy paths.

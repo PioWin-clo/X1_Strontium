@@ -7,8 +7,8 @@ Decentralized atomic time oracle for the X1 blockchain.
 
 > Polish version: [README.pl.md](README.pl.md)
 
-X1 Strontium aggregates measurements from 43 NTP sources across six
-continents (31 Stratum-1 / NTS-capable servers plus 12 pool fallbacks)
+X1 Strontium aggregates measurements from 45 NTP sources across six
+continents (33 Stratum-1 / NTS-capable servers plus 12 pool fallbacks)
 and writes consensus UTC timestamps to an Anchor smart contract on the
 X1 mainnet. Any X1 program can then call `read_time` over CPI to get a
 trustworthy clock — without depending on the unreliable on-chain
@@ -23,26 +23,6 @@ true drift at the NTP poll moment (v1.2.x had a phantom ~30 s offset);
 and two new Stratum-1 NTP sources land (`hora.roa.es`,
 `time2.kriss.re.kr`). The Program ID is preserved; the on-chain
 `OracleState` layout is unchanged.
-
----
-
-## The problem
-
-X1's `Clock::unix_timestamp` is sourced from the block leader's local
-clock and drifts substantially behind real UTC. Empirical measurements
-over six hours on 13.04.2026 (473 samples):
-
-| Time UTC | NTP        | Chain      | Drift |
-|----------|------------|------------|-------|
-| 22:40    | 22:40:01   | 22:39:47   | 13 s  |
-| 23:40    | 23:40:18   | 23:40:05   | 13 s  |
-| 00:40    | 00:40:32   | 00:40:18   | 14 s  |
-| 01:40    | 01:40:45   | 01:40:30   | 15 s  |
-| 02:40    | 02:40:39   | 02:40:21   | 18 s  |
-| 03:40    | 03:40:54   | 03:40:33   | 20 s  |
-
-**Average drift: 14.48 s** over 473 measurements. X1 Strontium provides
-the missing certified time reference.
 
 ---
 
@@ -147,9 +127,9 @@ Full walkthrough: [docs/OPERATOR_ONBOARDING.md](docs/OPERATOR_ONBOARDING.md).
 
 ```
  ┌────────────────────┐  SNTPv3   ┌────────────────────┐
- │ 43 NTP sources     │◄─────────►│ x1-strontium       │
+ │ 45 NTP sources     │◄─────────►│ x1-strontium       │
  │ (EU/AM/APAC/pool,  │           │ daemon             │
- │  31 Stratum-1 /    │           │  ├─ consensus      │
+ │  33 Stratum-1 /    │           │  ├─ consensus      │
  │  NTS-capable + 12  │           │  │  (median + IQR  │
  │  pool fallbacks)   │           │  │   + cross-tier) │
  └────────────────────┘           │  ├─ rotation       │
@@ -226,7 +206,7 @@ acceptable results.
 
 ## Key design choices
 
-- **Offset-based consensus** — the daemon polls 43 NTP sources, applies
+- **Offset-based consensus** — the daemon polls 45 NTP sources, applies
   a 3× IQR outlier filter on offsets (not timestamps), runs leap-second
   smear detection, and requires cross-tier agreement (at least one
   Stratum-1 / NTS source within 50 ms of the median). Confidence is a
@@ -318,8 +298,8 @@ Strontium-87 is the atom whose 5s² → 5s5p transition underpins the most
 accurate optical lattice clocks built so far — the ones that define
 the second to a few parts in 10⁻¹⁸. The name is aspirational, not a
 claim of comparable precision: the oracle's job is to deliver
-millisecond-grade UTC to a chain whose native clock drifts by tens of
-seconds. Same spirit, dramatically different scale.
+millisecond-grade UTC for on-chain applications that need sub-second
+timing. Same spirit, dramatically different scale.
 
 ---
 

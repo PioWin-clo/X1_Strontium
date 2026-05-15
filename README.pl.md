@@ -7,45 +7,26 @@ Zdecentralizowany atomowy oracle czasu dla blockchaina X1.
 
 > Wersja angielska: [README.md](README.md)
 
-X1 Strontium agreguje pomiary z 43 źródeł NTP rozmieszczonych na sześciu
-kontynentach (31 serwerów Stratum-1 / NTS oraz 12 zapasowych z poolu) i
+X1 Strontium agreguje pomiary z 45 źródeł NTP rozmieszczonych na sześciu
+kontynentach (33 serwerów Stratum-1 / NTS oraz 12 zapasowych z poolu) i
 zapisuje konsensusowe znaczniki czasu UTC do smart contractu Anchora w
 sieci głównej X1. Każdy program X1 może następnie wywołać `read_time`
 przez CPI, aby uzyskać wiarygodny zegar — bez polegania na zawodnym
 on-chainowym `Clock::unix_timestamp`.
 
-**v1.2.0** to upgrade in-place, który zastępuje proces onboardingu
-operatorów prostszym modelem opartym o pliki kluczy. Program ID jest
-zachowany (deploy przez `solana program deploy --program-id <existing>`),
-ale OracleState PDA dostaje czwarty segment seedów, więc PDA z v1.0
-(`EQ9CgHkx…`) staje się sierotą on-chain. Rejestracja to teraz jedna
-transakcja z dwoma podpisami, którą daemon składa sam; portfel sprzętowy
-operatora podpisuje wyłącznie pierwszy transfer XNT zasilający
-`oracle.json`.
+**v1.3** to upgrade in-place na bazie procesu onboardingu operatorów
+opartego o pliki kluczy z v1.2.0. Tolerancja cleanup przełącza się z
+per-fleet-size missed-turn count na stałe 24-godzinne okno wall-clock;
+daemon rejestruje się automatycznie przy starcie, gdy jego PDA zostało
+zamknięte przez wcześniejszy `cleanup_inactive`; pole `sysdrift=` w
+memo odzwierciedla teraz prawdziwy dryf w momencie pollowania NTP
+(v1.2.x miało phantom offset ~30 s); dochodzą też dwa nowe źródła
+Stratum-1 NTP (`hora.roa.es`, `time2.kriss.re.kr`). Program ID jest
+zachowany; layout `OracleState` on-chain bez zmian.
 
 ---
 
-## Problem
-
-`Clock::unix_timestamp` w X1 pochodzi z lokalnego zegara lidera bloku i
-znacząco opóźnia się względem realnego UTC. Pomiary empiryczne z
-13.04.2026 (6 godzin, 473 próbki):
-
-| Czas UTC | NTP        | Chain      | Dryf  |
-|----------|------------|------------|-------|
-| 22:40    | 22:40:01   | 22:39:47   | 13 s  |
-| 23:40    | 23:40:18   | 23:40:05   | 13 s  |
-| 00:40    | 00:40:32   | 00:40:18   | 14 s  |
-| 01:40    | 01:40:45   | 01:40:30   | 15 s  |
-| 02:40    | 02:40:39   | 02:40:21   | 18 s  |
-| 03:40    | 03:40:54   | 03:40:33   | 20 s  |
-
-**Średni dryf: 14,48 s** w 473 pomiarach. X1 Strontium dostarcza
-brakującego certyfikowanego źródła czasu.
-
----
-
-## Szybkie fakty (mainnet v1.2.0)
+## Szybkie fakty (mainnet v1.3)
 
 | Pole                    | Wartość                                                |
 |-------------------------|--------------------------------------------------------|
@@ -60,7 +41,7 @@ brakującego certyfikowanego źródła czasu.
 | Quorum                  | 10 % zarejestrowanych operatorów, min 1, max 6         |
 | Minimalny self-stake    | withdrawer-match: withdraw authority stake'a musi być równy authorized_withdrawer konta vote (gate off-chain) |
 | Minimalny wiek walidat. | 64 epoki historii głosowania (gate off-chain)          |
-| Próg auto-cleanup       | 10 własnych kolei rotacji opuszczonych z rzędu         |
+| Próg auto-cleanup       | 1440 contract-window'ów ciszy (~24 h, niezależne od rozmiaru fleeta — v1.3) |
 | Rozmiar konta on-chain  | 9744 B (488 B zapasu pod limitem 10 240 B CPI X1)      |
 | Maks. liczba operatorów | 512                                                    |
 
@@ -148,9 +129,9 @@ Pełny opis: [docs/OPERATOR_ONBOARDING.md](docs/OPERATOR_ONBOARDING.md).
 
 ```
  ┌────────────────────┐  SNTPv3   ┌────────────────────┐
- │ 43 źródła NTP      │◄─────────►│ x1-strontium       │
+ │ 45 źródeł NTP      │◄─────────►│ x1-strontium       │
  │ (EU/AM/APAC/pool,  │           │ daemon             │
- │  31 Stratum-1 /    │           │  ├─ consensus      │
+ │  33 Stratum-1 /    │           │  ├─ consensus      │
  │  NTS-capable + 12  │           │  │  (mediana + IQR │
  │  zapas. pool)      │           │  │   + cross-tier) │
  └────────────────────┘           │  ├─ rotacja        │
@@ -226,7 +207,7 @@ akceptowalne wyniki.
 
 ## Kluczowe decyzje projektowe
 
-- **Konsensus offset-based** — daemon odpytuje 43 źródła NTP, stosuje
+- **Konsensus offset-based** — daemon odpytuje 45 źródeł NTP, stosuje
   filtr odstających 3× IQR na offsetach (nie na timestampach), uruchamia
   detekcję leap-second smear i wymaga zgodności cross-tier (co najmniej
   jedno źródło Stratum-1 / NTS w obrębie 50 ms od mediany). Confidence
@@ -245,31 +226,60 @@ akceptowalne wyniki.
   match gate). Kontrakt nie zawiera parserów; gates żyją w open-sourcowym
   kodzie daemona, który każdy może zaudytować.
 
-- **Auto-cleanup nieaktywnych operatorów** — kontrakt usuwa
-  operatorów, którzy opuścili 10 swoich kolejnych kolei rotacji z
-  rzędu. Próg skaluje się naturalnie z rozmiarem fleeta (~100 min dla
-  n=2, ~14 h dla n=100). Permissionless: każdy może wywołać instrukcję
-  `cleanup_inactive` z batchem rejestracji w `remaining_accounts`. Brak
-  usuwania administracyjnego, brak głosowania governance.
+- **Auto-cleanup nieaktywnych operatorów** — operatorzy, którzy nie
+  wysyłają `submit_time` przez ~24 godziny, są usuwani z aktywnego
+  zbioru przez `cleanup_inactive`, niezależnie od rozmiaru fleeta.
+  Jeden dzień tolerancji pokrywa reboot'y, okna serwisowe i
+  przejściowe outage'y sieci bez ręcznej interwencji. (Zachowanie
+  v1.3+; v1.2.x używał matematyki per-turn missed-count, która dawała
+  tylko ~22 min tolerancji przy n=2 i ~14 h przy n=100 — naprawione w
+  changelogu v1.3.) Permissionless: każdy może wywołać instrukcję
+  `cleanup_inactive` z batchem rejestracji w `remaining_accounts`, a
+  rent odzyskany z każdego zamkniętego PDA wraca do payera cleanup-TX.
+  Brak usuwania administracyjnego, brak głosowania governance.
 
 - **Jedna rejestracja na klucz oracle** — rotacja = wygeneruj świeży
   `oracle.json`, zasil go i zarejestruj się ponownie. Stara
-  rejestracja auto-cleanuje się po 10 opuszczonych koleach. Brak
-  on-chainowej instrukcji "rotate"; brak ceremonii portfela
-  sprzętowego dla rutynowej rotacji klucza.
+  rejestracja auto-cleanuje się po 24 h ciszy. v1.3+ auto-recoveruje
+  przy starcie: jeśli daemon znajdzie swoje PDA brakujące lub
+  nieaktywne, sam buduje i wysyła 2-podpisową transakcję
+  `register_submitter` (gate'owaną przez balance oracle, dostępność
+  vote keypair i ten sam anti-farm self-stake check co manualna
+  podkomenda `register`). Brak on-chainowej instrukcji "rotate"; brak
+  ceremonii portfela sprzętowego dla rutynowej rotacji klucza.
 
 ---
 
 ## Roadmap
 
-- **v1.2.0** (ten release) — kalkulacja runway uwzględnia rozmiar
-  fleeta n, naprawa install (unit file zawsze zapisany), cichy fallback
-  RPC, chain drift + sysdrift w outpucie status, pre-computation NTP
-  polling (sub-200ms timing TX), withdrawer-match gate stake.
+- **v1.3** (ten release) — 24-godzinne wall-clock okno cleanup
+  (`CLEANUP_GRACE_WINDOWS = 1440`, niezależne od rozmiaru fleeta),
+  auto-recover przy starcie gdy rejestracja PDA jest brakująca lub
+  oznaczona jako nieaktywna (gate'owane przez 0,6 XNT minimalnego
+  balance + withdrawer-match self-stake), pole `sysdrift=` w memo czyta
+  zcache'owany snapshot dryfu z momentu pollowania NTP (naprawia
+  phantom offset ~30 s pod architekturą pre-poll), dwa nowe źródła
+  Stratum-1 NTP (`hora.roa.es`, `time2.kriss.re.kr`), endpointy
+  System76 przeniesione na Stratum 2 zgodnie z faktycznymi odpowiedziami.
 
-- **v1.3** — prawdziwa autoryzacja NTS-KE na endpointach z obsługą NTS.
-  Dziś daemon odpytuje te serwery zwykłym NTP; label tieru `nts` jest
-  informacyjny do czasu wdrożenia handshake'u session-key.
+- **v1.2.1** (poprzedni) — fix DNS-fallback w `RpcClient` (bypass
+  cooldown'ów gdy każdy URL jest cold), defensywny guard na rendererze
+  drift w `x1sr status`, `cleanup_inactive` zamyka PDA zamiast tylko
+  flagować `is_active = false` (więc ten sam `oracle_keypair` może
+  rejestrować się ponownie czysto).
+
+- **v1.2.0** (początek linii v1.2) — kalkulacja runway uwzględnia
+  rozmiar fleeta n, naprawa install (unit file zawsze zapisany), cichy
+  fallback RPC, chain drift + sysdrift w outpucie status,
+  pre-computation NTP polling (sub-200ms timing TX), withdrawer-match
+  gate stake.
+
+- **v1.4 (proponowane)** — prawdziwa autoryzacja NTS-KE na endpointach
+  z obsługą NTS. Dziś daemon odpytuje te serwery zwykłym NTP; label
+  tieru `nts` jest informacyjny do czasu wdrożenia handshake'u
+  session-key. Prawdopodobnie również: re-probe USNO×2 + INRIM +
+  named-region fallbacków z produkcyjnej sieci Sentinel, dodanie tych,
+  które odpowiedzą.
 
 - **v∞ — lock kontraktu.** Po dołączeniu wielu operatorów ponad Prime +
   Sentinel oraz wdrożeniu update'u walidatora Tachyon, upgrade
@@ -293,9 +303,9 @@ Stront-87 to atom, którego przejście 5s² → 5s5p stanowi podstawę
 najdokładniejszych zegarów optycznych zbudowanych do tej pory — tych,
 które definiują sekundę z precyzją kilku części na 10⁻¹⁸. Nazwa jest
 aspiracyjna, nie roszczeniem do porównywalnej precyzji: zadaniem oracle
-jest dostarczyć UTC z dokładnością milisekundową łańcuchowi, którego
-natywny zegar dryfuje o dziesiątki sekund. Ten sam duch, dramatycznie
-inna skala.
+jest dostarczyć UTC z dokładnością milisekundową dla aplikacji on-chain
+wymagających sub-sekundowego timingu. Ten sam duch, dramatycznie inna
+skala.
 
 ---
 
